@@ -1,10 +1,12 @@
 name: Daily line-up update
 
-# Corre todos los dias a las 13:00 UTC (10:00 ART).
-# Tambien puede ejecutarse manualmente desde la pestana "Actions" del repo.
+# Trigger manual solamente.
+# (El cron se removio porque los runners de GitHub Actions no pueden alcanzar
+# www.isa-agents.com.ar -- el server responde timeout a esas IPs. El update
+# diario corre via Programador de Tareas de Windows en la PC del usuario.)
+# Se puede disparar manualmente desde la pestana "Actions" del repo si se
+# configura un proxy o se corre desde una IP argentina.
 on:
-  schedule:
-    - cron: "0 13 * * *"
   workflow_dispatch:
 
 jobs:
