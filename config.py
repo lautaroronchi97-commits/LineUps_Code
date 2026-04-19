@@ -78,6 +78,225 @@ PRODUCTOS_AGRO_TODOS = (
 
 
 # ---------------------------------------------------------------------------
+# Rediseno v2: productos PRIORITARIOS para el trading desk
+# ---------------------------------------------------------------------------
+# El usuario definio que solo le importan 8 productos (los 4 del complejo soja,
+# maiz, trigo, cebada, sorgo y girasol). El resto se filtra por default.
+#
+# Cada entrada es (codigo_interno_en_DB, nombre_display, familia).
+# La familia se usa para agrupar en el tab Panorama.
+
+PRODUCTOS_PRIORITARIOS = [
+    # (codigo, display, familia)
+    ("SBS",     "Soja",          "Soja"),
+    ("SBM",     "Harina soja",   "Soja"),
+    ("SBO",     "Aceite soja",   "Soja"),
+    ("MAIZE",   "Maiz",          "Maiz"),
+    ("WHEAT",   "Trigo",         "Trigo"),
+    ("BARLEY",  "Cebada",        "Cebada"),
+    ("SORGHUM", "Sorgo",         "Sorgo"),
+    ("SFSEED",  "Girasol",       "Girasol"),
+]
+
+# Set de codigos para filtros rapidos.
+CODIGOS_PRIORITARIOS = {codigo for codigo, _, _ in PRODUCTOS_PRIORITARIOS}
+
+# Display label por codigo (ej "SBM" -> "Harina soja").
+PRODUCTO_DISPLAY = {codigo: display for codigo, display, _ in PRODUCTOS_PRIORITARIOS}
+
+
+# ---------------------------------------------------------------------------
+# Paleta de colores fija por shipper canonico (Bloomberg dark theme)
+# ---------------------------------------------------------------------------
+# Colores altamente saturados sobre fondo oscuro. Cada shipper mantiene
+# SIEMPRE el mismo color en todos los graficos del dashboard (facilita lectura
+# rapida cuando uno esta acostumbrado a la vista).
+
+SHIPPER_COLORS: dict[str, str] = {
+    "VITERRA-BUNGE": "#FF9900",  # amber (dominante en soja)
+    "CARGILL":       "#00D4FF",  # cyan
+    "COFCO":         "#FF3333",  # red (marca china)
+    "LDC":           "#CC66FF",  # violeta
+    "ADM":           "#FF66CC",  # rosa
+    "AGD":           "#33FF99",  # verde menta
+    "ACA":           "#FFD700",  # dorado (cooperativas)
+    "MOLINOS":       "#66FF66",  # verde
+    "QUILMES":       "#FF6600",  # naranja (cerveza)
+    "GLENCORE":      "#9999FF",  # celeste
+    "OLAM":          "#FFCC33",  # mostaza
+    "OTROS":         "#808080",  # gris neutro
+}
+
+# Paleta Bloomberg (para elementos generales del dashboard).
+BLOOMBERG_PALETTE = {
+    "bg_primary":   "#0A0E1A",   # fondo principal
+    "bg_card":      "#141B2B",   # cards/containers
+    "bg_hover":     "#1E2738",
+    "accent":       "#FF9900",   # amber signature Bloomberg
+    "accent_blue":  "#00D4FF",
+    "positive":     "#00FF88",
+    "negative":     "#FF3B3B",
+    "warning":      "#FFCC00",
+    "text_primary": "#E1E5EE",
+    "text_muted":   "#8899AA",
+    "grid":         "#1A2332",
+}
+
+
+# ---------------------------------------------------------------------------
+# Zonas climaticas (FASE 2: pronostico Open-Meteo 7 dias)
+# ---------------------------------------------------------------------------
+# Coordenadas centroides de los 4 nodos portuarios mas importantes.
+# Gran Rosario se divide en Norte y Sur segun pedido del usuario.
+
+ZONAS_CLIMA: dict[str, dict[str, float | str]] = {
+    "Gran Rosario Norte": {
+        "lat": -32.833, "lon": -60.733,
+        "descripcion": "San Lorenzo, Timbues, San Martin, Rosario",
+    },
+    "Gran Rosario Sur": {
+        "lat": -33.017, "lon": -60.633,
+        "descripcion": "General Lagos, Alvear",
+    },
+    "Bahia Blanca": {
+        "lat": -38.717, "lon": -62.267,
+        "descripcion": "Puerto Galvan, Ingeniero White",
+    },
+    "Necochea/Quequen": {
+        "lat": -38.583, "lon": -58.700,
+        "descripcion": "Puerto Quequen",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Agrupacion de puertos por zona (para tab Congestion)
+# ---------------------------------------------------------------------------
+# Mapea cada puerto (como aparece en la columna `port` de la DB) a su zona.
+# Los puertos del Gran Rosario se dividen Norte/Sur. Los no listados caen
+# en "Otros".
+
+PUERTOS_GRAN_ROSARIO_SUR = {
+    "GENERAL LAGOS",
+    "PUERTO GRAL. LAGOS",
+    "ARROYO SECO",
+    "PUNTA ALVEAR",
+    "ALVEAR",
+}
+
+PUERTOS_GRAN_ROSARIO_NORTE = {
+    "ROSARIO",
+    "SAN LORENZO",
+    "SAN MARTIN",
+    "PUERTO SAN MARTIN",
+    "TIMBUES",
+    "PUERTO GENERAL SAN MARTIN",
+    "RICARDONE",
+}
+
+PUERTOS_BAHIA_BLANCA = {
+    "BAHIA BLANCA",
+    "PUERTO GALVAN",
+    "INGENIERO WHITE",
+    "CARGILL BAHIA",
+}
+
+PUERTOS_NECOCHEA = {
+    "NECOCHEA",
+    "QUEQUEN",
+    "PUERTO QUEQUEN",
+}
+
+# Alto Parana: puertos argentinos al norte del Gran Rosario (rio arriba).
+# San Nicolas y Ramallo estan cerca pero no son parte del nodo Rosario.
+PUERTOS_ALTO_PARANA = {
+    "SAN NICOLAS",
+    "CAMPANA",
+    "RAMALLO",
+    "ZARATE",
+    "LIMA",
+    "DEL GUAZU",
+    "GUAZU",
+}
+
+# Buenos Aires / La Plata (estuario del Rio de la Plata).
+PUERTOS_BUENOS_AIRES = {
+    "LA PLATA",
+    "DOCK SUD",
+    "BUENOS AIRES",
+    "PUERTO NUEVO",
+}
+
+# Uruguay (casi siempre transbordo o corta de soja PY/BR).
+PUERTOS_URUGUAY = {
+    "MONTEVIDEO",
+    "NUEVA PALMIRA",
+    "PAYSANDU",
+    "FRAY BENTOS",
+    "PUERTO NUEVA PALMIRA",
+}
+
+# Patagonia argentina.
+PUERTOS_PATAGONIA = {
+    "PUERTO MADRYN",
+    "COMODORO RIVADAVIA",
+    "PUERTO ROSALES",
+    "PUNTA COLORADA",
+    "CALETA PAULA",
+    "USHUAIA",
+}
+
+
+def zona_de_puerto(port: str | None) -> str:
+    """
+    Devuelve la zona portuaria a la que pertenece un puerto.
+
+    Zonas: Gran Rosario Norte/Sur, Bahia Blanca, Necochea/Quequen,
+    Alto Parana, Buenos Aires/La Plata, Uruguay, Patagonia, Otros.
+    Comparacion case-insensitive con match exacto primero, despues substring
+    como fallback para variantes ortograficas.
+    """
+    if not port:
+        return "Otros"
+    p = port.upper().strip()
+    # Match exacto primero.
+    if p in PUERTOS_GRAN_ROSARIO_NORTE:
+        return "Gran Rosario Norte"
+    if p in PUERTOS_GRAN_ROSARIO_SUR:
+        return "Gran Rosario Sur"
+    if p in PUERTOS_BAHIA_BLANCA:
+        return "Bahia Blanca"
+    if p in PUERTOS_NECOCHEA:
+        return "Necochea/Quequen"
+    if p in PUERTOS_ALTO_PARANA:
+        return "Alto Parana"
+    if p in PUERTOS_BUENOS_AIRES:
+        return "Buenos Aires/La Plata"
+    if p in PUERTOS_URUGUAY:
+        return "Uruguay"
+    if p in PUERTOS_PATAGONIA:
+        return "Patagonia"
+    # Fallback por substring.
+    if "LAGOS" in p or "ALVEAR" in p:
+        return "Gran Rosario Sur"
+    if "ROSARIO" in p or "SAN LORENZO" in p or "SAN MARTIN" in p or "TIMBUES" in p or "RICARDONE" in p:
+        return "Gran Rosario Norte"
+    if "BAHIA" in p or "GALVAN" in p or "WHITE" in p:
+        return "Bahia Blanca"
+    if "QUEQUEN" in p or "NECOCHEA" in p:
+        return "Necochea/Quequen"
+    if "MONTEVIDEO" in p or "PALMIRA" in p or "PAYSANDU" in p or "FRAY BENTOS" in p:
+        return "Uruguay"
+    if "MADRYN" in p or "COMODORO" in p or "ROSALES" in p or "USHUAIA" in p:
+        return "Patagonia"
+    if "CAMPANA" in p or "NICOLAS" in p or "RAMALLO" in p or "ZARATE" in p or "GUAZU" in p:
+        return "Alto Parana"
+    if "LA PLATA" in p or "DOCK SUD" in p or "BUENOS AIRES" in p:
+        return "Buenos Aires/La Plata"
+    return "Otros"
+
+
+# ---------------------------------------------------------------------------
 # Schema esperado de la tabla HTML (sanity check)
 # ---------------------------------------------------------------------------
 
