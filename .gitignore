@@ -1,0 +1,31 @@
+# Credenciales - NUNCA commitear
+.env
+.streamlit/secrets.toml
+
+# Entornos virtuales de Python
+.venv/
+venv/
+env/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Logs
+logs/
+*.log
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Archivos temporales del proyecto
+*.tmp
+*.bak
+
+# Claude Code (asistente local, no va al repo)
+.claude/
