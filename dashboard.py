@@ -18,11 +18,25 @@ Arquitectura:
 
 from __future__ import annotations
 
+import os
 from datetime import date, timedelta
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+# En Streamlit Cloud no hay .env: los valores vienen de st.secrets.
+# Los copiamos a env vars ANTES de importar db.py para que get_client()
+# los encuentre via os.getenv(). Hacemos strip() para evitar whitespace
+# invisible que rompe la autenticacion con Supabase.
+for _nombre_secret in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"):
+    try:
+        _valor = st.secrets[_nombre_secret]
+        if isinstance(_valor, str):
+            os.environ[_nombre_secret] = _valor.strip()
+    except (KeyError, FileNotFoundError):
+        # Local dev: no hay secrets.toml, se usa .env via python-dotenv.
+        pass
 
 from config import (
     PRODUCTOS_ACEITES,
@@ -87,6 +101,19 @@ if not estado["conectado"]:
         "Verifica que el archivo `.env` (o los secrets de Streamlit Cloud) "
         "tengan SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY validos."
     )
+    # Diagnostico: muestra que vars esta recibiendo la app (sin exponer
+    # el valor completo del service_role key).
+    with st.expander("🔧 Diagnostico de credenciales", expanded=True):
+        url = os.environ.get("SUPABASE_URL", "")
+        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+        st.write(f"**SUPABASE_URL**: longitud={len(url)}, valor={url!r}")
+        st.write(f"**SUPABASE_SERVICE_ROLE_KEY**: longitud={len(key)}")
+        if key:
+            st.write(f"  - Primeros 10: `{key[:10]}`")
+            st.write(f"  - Ultimos 10: `{key[-10:]}`")
+            st.write(f"  - Cantidad de puntos (.): {key.count('.')} (deberia ser 2)")
+            st.write(f"  - Tiene saltos de linea: {chr(10) in key or chr(13) in key}")
+            st.write(f"  - Tiene espacios: {' ' in key}")
     st.stop()
 
 if estado["cantidad_filas"] == 0:
