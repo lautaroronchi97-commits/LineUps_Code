@@ -103,17 +103,27 @@ if not estado["conectado"]:
     )
     # Diagnostico: muestra que vars esta recibiendo la app (sin exponer
     # el valor completo del service_role key).
+    import hashlib
     with st.expander("🔧 Diagnostico de credenciales", expanded=True):
         url = os.environ.get("SUPABASE_URL", "")
         key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
         st.write(f"**SUPABASE_URL**: longitud={len(url)}, valor={url!r}")
         st.write(f"**SUPABASE_SERVICE_ROLE_KEY**: longitud={len(key)}")
         if key:
-            st.write(f"  - Primeros 10: `{key[:10]}`")
-            st.write(f"  - Ultimos 10: `{key[-10:]}`")
+            sha = hashlib.sha256(key.encode()).hexdigest()[:16]
+            st.write(f"  - SHA256 primeros 16: `{sha}` (esperado: `f2189759c7e634ed`)")
+            st.write(f"  - Primeros 20: `{key[:20]}`")
+            st.write(f"  - Chars 50-70: `{key[50:70] if len(key) >= 70 else 'N/A'}`")
+            st.write(f"  - Chars 100-120: `{key[100:120] if len(key) >= 120 else 'N/A'}`")
+            st.write(f"  - Chars 150-170: `{key[150:170] if len(key) >= 170 else 'N/A'}`")
+            st.write(f"  - Ultimos 20: `{key[-20:]}`")
             st.write(f"  - Cantidad de puntos (.): {key.count('.')} (deberia ser 2)")
-            st.write(f"  - Tiene saltos de linea: {chr(10) in key or chr(13) in key}")
-            st.write(f"  - Tiene espacios: {' ' in key}")
+            # Chars no-ASCII (todos los JWT estan en ASCII):
+            no_ascii = [(i, c, ord(c)) for i, c in enumerate(key) if ord(c) > 127]
+            if no_ascii:
+                st.error(f"ERROR: la key tiene {len(no_ascii)} caracteres no-ASCII: {no_ascii[:5]}")
+            else:
+                st.write("  - Todos los chars son ASCII (OK)")
     st.stop()
 
 if estado["cantidad_filas"] == 0:
