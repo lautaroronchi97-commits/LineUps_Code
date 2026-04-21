@@ -317,8 +317,18 @@ with st.sidebar:
         f"**Ultima data en DB:** {fecha_max_db}  \n"
         f"**Hoy:** {date.today()}"
     )
-    if fecha_max_db < date.today() - timedelta(days=1):
-        st.warning("⚠ La DB no tiene data de ayer. Correr update_today.py.")
+    dias_atrasados = (date.today() - fecha_max_db).days
+    if dias_atrasados >= 2:
+        # 2+ dias: probablemente ISA no publica (scraper corre todos los dias).
+        st.warning(
+            f"⚠ Ultima data ISA: {fecha_max_db} ({dias_atrasados} dias atras).  \n"
+            "ISA suele no publicar fines de semana/feriados. Si persiste varios "
+            "dias habiles seguidos, verificar manualmente en isa-agents.com.ar."
+        )
+    elif dias_atrasados == 1:
+        # 1 dia: normal si hoy es lunes (sabado/domingo sin data) o si aun no
+        # se disparo el update del dia.
+        st.info(f"Ultima data: {fecha_max_db}. Update corre diario a las 10:00.")
 
 
 # ---------------------------------------------------------------------------
