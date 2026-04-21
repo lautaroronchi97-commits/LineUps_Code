@@ -163,6 +163,32 @@ def test_productos(fecha_ref: date, codigo: str = "MAIZE") -> None:
         print(f"Al dia {dia}: p10={int(p10[dia-1]):,} mediana={int(p50[dia-1]):,} p90={int(p90[dia-1]):,}")
 
 
+def test_estimaciones() -> None:
+    print("\n=== ESTIMACIONES MAGyP ===")
+    import estimaciones
+    df = estimaciones.descargar_estimaciones_magyp()
+    print(f"CSV descargado: {df.shape[0]:,} filas")
+    if df.empty:
+        print("ERROR: DataFrame vacio")
+        return
+    tot = estimaciones.totales_nacionales_por_campania(df)
+    print(f"Totales nacionales: {tot.shape[0]} filas")
+    for codigo in ["MAIZE", "SBS", "WHEAT", "BARLEY", "SORGHUM", "SFSEED"]:
+        ult = estimaciones.ultima_campania_por_cultivo(tot, codigo, n=3)
+        if ult.empty:
+            print(f"  {codigo:10} sin data")
+            continue
+        ult = estimaciones.variacion_vs_campania_anterior(ult)
+        fila = ult.iloc[0]
+        pct = fila.get("pct_vs_anterior")
+        pct_str = f"{pct:+.1f}%" if pd.notna(pct) else "-"
+        print(
+            f"  {codigo:10} {fila['campania']}: "
+            f"{fila['produccion_tm']/1_000_000:6.2f} Mt  "
+            f"rinde {int(fila['rinde_kgxha']):5,} kg/ha  {pct_str}"
+        )
+
+
 def test_congestion(fecha_ref: date) -> None:
     print("\n=== CONGESTION ===")
     df = query_en_puerto_ahora(fecha_ref)
@@ -189,3 +215,10 @@ if __name__ == "__main__":
         except Exception:
             print(f"\n!!! ERROR en {test.__name__}:")
             traceback.print_exc()
+
+    # Test estimaciones (no necesita fecha_ref, hace su propia red).
+    try:
+        test_estimaciones()
+    except Exception:
+        print("\n!!! ERROR en test_estimaciones:")
+        traceback.print_exc()

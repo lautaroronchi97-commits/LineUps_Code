@@ -50,6 +50,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 import campanas
+import clima as clima_mod
+import estimaciones as estim_mod
+import fob_djve
 from config import (
     BLOOMBERG_PALETTE,
     CODIGOS_PRIORITARIOS,
@@ -213,6 +216,35 @@ def cached_en_puerto_ahora(fecha: date) -> pd.DataFrame:
     df = aplicar_a_dataframe(df)
     df["zona"] = df["port"].apply(zona_de_puerto)
     return df
+
+
+@st.cache_data(ttl=3600, show_spinner="Consultando pronostico climatico...")
+def cached_clima_zonas() -> dict[str, pd.DataFrame]:
+    """
+    Pronostico 7 dias para las 4 zonas portuarias.
+    Cache 1h: Open-Meteo actualiza cada hora y no tiene sentido pegarle
+    mas seguido. Si falla, devuelve dict con DataFrames vacios.
+    """
+    return clima_mod.pronostico_todas_zonas()
+
+
+@st.cache_data(ttl=3600, show_spinner="Descargando DJVE del MAGyP...")
+def cached_djve(anio: int) -> pd.DataFrame:
+    """
+    DJVE acumuladas del MAGyP (declaraciones juradas de ventas al exterior).
+    Cache 1h: MAGyP actualiza intra-day pero 1 pull/h alcanza para analisis.
+    """
+    return fob_djve.descargar_djve_acumuladas(anio)
+
+
+@st.cache_data(ttl=86400, show_spinner="Descargando estimaciones MAGyP...")
+def cached_estimaciones() -> pd.DataFrame:
+    """
+    Estimaciones agricolas MAGyP (historico completo por cultivo/campania).
+    Cache 24h: MAGyP actualiza cada ~6 meses, no tiene sentido pegarle mas.
+    El archivo pesa ~15 MB, la descarga tarda ~30s la primera vez.
+    """
+    return estim_mod.descargar_estimaciones_magyp()
 
 
 # ===========================================================================
@@ -937,6 +969,70 @@ with tab_prd:
             use_container_width=True, hide_index=True,
         )
 
+        # ------------------- DJVE: ventas declaradas (MAGyP) -------------------
+        st.divider()
+        st.subheader(f"DJVE · ventas declaradas MAGyP · {display_prd}")
+        st.caption(
+            "Las DJVE (Ley 21.453) son registros oficiales de ventas al exterior. "
+            "Un pico en DJVE anticipa actividad portuaria 30-60 dias despues."
+        )
+
+        df_djve = cached_djve(fecha_ref.year)
+        if df_djve.empty:
+            st.info(
+                "No pude descargar DJVE del MAGyP. "
+                "El servidor a veces devuelve 403/timeout; reintentar."
+            )
+        else:
+            # Serie diaria de toneladas para este producto.
+            serie_djve = fob_djve.djve_diarias(df_djve, codigo_interno=codigo_prd)
+
+            if serie_djve.empty:
+                st.info(f"Sin DJVE de {display_prd} en {fecha_ref.year}.")
+            else:
+                # Ultimos 60 dias para no saturar el grafico.
+                corte = fecha_ref - timedelta(days=60)
+                serie_djve = serie_djve[serie_djve["fecha_registro"] >= corte]
+
+                # KPIs DJVE de los ultimos 30 dias + top exportador.
+                djve_30d = fob_djve.djve_por_producto_recientes(
+                    df_djve, dias=30, hasta=fecha_ref,
+                )
+                fila = djve_30d[djve_30d["codigo_interno"] == codigo_prd]
+
+                if not fila.empty:
+                    k1, k2, k3 = st.columns(3)
+                    k1.metric("DJVE ultimos 30d (tons)",
+                              fmt_tons(fila.iloc[0]["toneladas"]))
+                    k2.metric("N° de declaraciones",
+                              int(fila.iloc[0]["n_djve"]))
+                    k3.metric("Top exportador",
+                              fila.iloc[0]["razon_social_top"][:25])
+
+                # Chart: barras diarias.
+                if not serie_djve.empty:
+                    fig_djve = go.Figure()
+                    fig_djve.add_bar(
+                        x=serie_djve["fecha_registro"],
+                        y=serie_djve["toneladas"],
+                        marker_color=BLOOMBERG_PALETTE["accent_blue"],
+                        opacity=0.75,
+                        name="DJVE diarias",
+                    )
+                    # MM 7d overlay.
+                    serie_djve["ma7"] = serie_djve["toneladas"].rolling(7, min_periods=1).mean()
+                    fig_djve.add_scatter(
+                        x=serie_djve["fecha_registro"], y=serie_djve["ma7"],
+                        mode="lines", name="MM 7d",
+                        line=dict(color=BLOOMBERG_PALETTE["accent"], width=2),
+                    )
+                    aplicar_tema(fig_djve)
+                    fig_djve.update_layout(
+                        height=300, yaxis_title="Toneladas declaradas",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    )
+                    st.plotly_chart(fig_djve, use_container_width=True)
+
         # ------------------- Top shippers de este producto -------------------
         st.divider()
         st.subheader(f"Top shippers de {display_prd} · campana {campana_actual}")
@@ -956,6 +1052,106 @@ with tab_prd:
         aplicar_tema(fig_shp_prd)
         fig_shp_prd.update_layout(height=340, showlegend=False)
         st.plotly_chart(fig_shp_prd, use_container_width=True)
+
+        # ------------------- Estimaciones MAGyP: contexto macro ---------------
+        st.divider()
+        st.subheader(f"Produccion historica · {display_prd} (MAGyP)")
+        st.caption(
+            "Estimaciones oficiales MAGyP por campana cerrada. "
+            "Util para dimensionar el line-up contra produccion real. "
+            "Fuente: datos.magyp.gob.ar (actualiza cada ~6 meses)."
+        )
+
+        df_estim = cached_estimaciones()
+        if df_estim.empty:
+            st.warning(
+                "No pude descargar las estimaciones del MAGyP. "
+                "Reintentar mas tarde o consultar manualmente el dataset."
+            )
+        else:
+            totales = estim_mod.totales_nacionales_por_campania(df_estim)
+            ult = estim_mod.ultima_campania_por_cultivo(totales, codigo_prd, n=6)
+            ult = estim_mod.variacion_vs_campania_anterior(ult)
+
+            if ult.empty:
+                st.info(
+                    f"MAGyP no reporta {display_prd} como cultivo separado "
+                    "(ej. harinas y aceites no estan en esta fuente)."
+                )
+            else:
+                # KPIs: ultima campana vs anterior.
+                fila_ult = ult.iloc[0]
+                fila_ant = ult.iloc[1] if len(ult) > 1 else None
+
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric(
+                    f"Produccion {fila_ult['campania']}",
+                    f"{fila_ult['produccion_tm'] / 1_000_000:.1f} Mt",
+                    delta=(f"{fila_ult['pct_vs_anterior']:+.1f}% vs anterior"
+                           if pd.notna(fila_ult.get("pct_vs_anterior")) else None),
+                )
+                k2.metric(
+                    "Area sembrada",
+                    f"{fila_ult['sembrada_ha'] / 1_000_000:.2f} M ha",
+                )
+                k3.metric(
+                    "Rinde nacional",
+                    f"{int(fila_ult['rinde_kgxha']):,} kg/ha",
+                )
+                if fila_ant is not None:
+                    k4.metric(
+                        f"Vs {fila_ant['campania']}",
+                        f"{fila_ant['produccion_tm'] / 1_000_000:.1f} Mt",
+                    )
+
+                # Grafico de barras: ultimas 6 campanas.
+                ult_asc = ult.sort_values("campania", ascending=True).reset_index(drop=True)
+                color_estim = PRODUCTO_DISPLAY.get(codigo_prd, (display_prd, BLOOMBERG_PALETTE["accent"]))[1]
+
+                fig_estim = go.Figure()
+                fig_estim.add_bar(
+                    x=ult_asc["campania"],
+                    y=ult_asc["produccion_tm"] / 1_000_000,
+                    marker_color=color_estim,
+                    text=[f"{v:.1f} Mt" for v in ult_asc["produccion_tm"] / 1_000_000],
+                    textposition="outside",
+                    name="Produccion",
+                )
+                aplicar_tema(fig_estim)
+                fig_estim.update_layout(
+                    height=320,
+                    yaxis_title="Produccion (Mt)",
+                    xaxis_title="Campana",
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_estim, use_container_width=True)
+
+                # Tabla de detalle.
+                tabla_estim = ult.copy()
+                tabla_estim["Produccion"] = (tabla_estim["produccion_tm"] / 1_000_000).round(2).astype(str) + " Mt"
+                tabla_estim["Sembrada"] = (tabla_estim["sembrada_ha"] / 1_000_000).round(2).astype(str) + " M ha"
+                tabla_estim["Rinde"] = tabla_estim["rinde_kgxha"].apply(lambda v: f"{int(v):,} kg/ha")
+                tabla_estim["Var %"] = tabla_estim["pct_vs_anterior"].apply(
+                    lambda v: f"{v:+.1f}%" if pd.notna(v) else "-"
+                )
+                st.dataframe(
+                    tabla_estim[["campania", "Produccion", "Sembrada", "Rinde", "Var %"]]
+                    .rename(columns={"campania": "Campana"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+        # Links a reportes externos (BCBA + BCR) que no se pueden scrapear.
+        with st.expander("Reportes semanales externos (BCBA / BCR)"):
+            st.caption(
+                "Para estimaciones de la campana EN CURSO (no incluidas en MAGyP) "
+                "consultar manualmente estos reportes semanales:"
+            )
+            for nombre, meta in estim_mod.links_reportes_semanales().items():
+                st.markdown(
+                    f"**[{meta['nombre']}]({meta['url']})**  \n"
+                    f"Frecuencia: {meta['frecuencia']}  \n"
+                    f"Cubre: {meta['cubre']}"
+                )
 
 
 # ==========================================================================
@@ -1063,6 +1259,70 @@ with tab_cng:
             aplicar_tema(fig_cong)
             fig_cong.update_layout(height=360, legend=dict(orientation="h", yanchor="bottom", y=1.02))
             st.plotly_chart(fig_cong, use_container_width=True)
+
+    # -------------------------------------------------------------------
+    # Pronostico climatico 7 dias (4 zonas) via Open-Meteo
+    # -------------------------------------------------------------------
+    st.divider()
+    st.subheader("Pronostico 7 dias · zonas portuarias")
+    st.caption(
+        "Lluvia >5mm o rafaga >40km/h puede parar operaciones (elevadores "
+        "no cargan bajo lluvia, puertos cierran con vientos fuertes). "
+        "Fuente: Open-Meteo."
+    )
+
+    pronosticos = cached_clima_zonas()
+
+    for zona, df_clima in pronosticos.items():
+        if df_clima.empty:
+            st.warning(f"**{zona}**: no pude traer pronostico (Open-Meteo fallo).")
+            continue
+
+        df_clima = df_clima.copy()
+        df_clima["riesgo"] = df_clima.apply(clima_mod.clasificar_riesgo, axis=1)
+
+        with st.expander(f"☁  {zona}", expanded=True):
+            # Fila de 7 tarjetas compactas (una por dia).
+            cols = st.columns(7)
+            for i, (_, row) in enumerate(df_clima.iterrows()):
+                with cols[i]:
+                    # Card custom con HTML para controlar look Bloomberg.
+                    color_borde = {
+                        "🔴 ALTO":  BLOOMBERG_PALETTE["negative"],
+                        "🟡 MEDIO": BLOOMBERG_PALETTE["warning"],
+                        "🟢 BAJO":  BLOOMBERG_PALETTE["positive"],
+                        "⚪ OK":    BLOOMBERG_PALETTE["text_muted"],
+                    }.get(row["riesgo"], BLOOMBERG_PALETTE["text_muted"])
+
+                    st.markdown(
+                        f"""
+                        <div style='
+                            background:{BLOOMBERG_PALETTE["bg_card"]};
+                            border:1px solid {color_borde};
+                            border-radius:4px;
+                            padding:8px 6px;
+                            text-align:center;
+                            font-family:Consolas,monospace;
+                            min-height:140px;
+                        '>
+                            <div style='font-size:11px; color:{BLOOMBERG_PALETTE["text_muted"]};'>
+                                {row["fecha"].strftime("%a %d-%b")}
+                            </div>
+                            <div style='font-size:32px; margin:4px 0;'>{row["emoji"]}</div>
+                            <div style='font-size:13px; color:{BLOOMBERG_PALETTE["accent"]}; font-weight:700;'>
+                                {row["t_min"]:.0f}° / {row["t_max"]:.0f}°C
+                            </div>
+                            <div style='font-size:11px; color:{BLOOMBERG_PALETTE["accent_blue"]};'>
+                                💧 {row["lluvia_mm"]:.1f}mm ({row["prob_lluvia"]:.0f}%)
+                            </div>
+                            <div style='font-size:11px; color:{BLOOMBERG_PALETTE["text_primary"]};'>
+                                💨 {row["viento_kmh"]:.0f} km/h
+                            </div>
+                            <div style='font-size:10px; margin-top:4px;'>{row["riesgo"]}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
 
 
 # ---------------------------------------------------------------------------
