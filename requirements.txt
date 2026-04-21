@@ -6,6 +6,8 @@ lxml>=5.3
 # Datos
 pandas>=2.2
 python-dateutil>=2.9
+# openpyxl necesario para leer los XLSX del MAGyP (DJVE).
+openpyxl>=3.1
 
 # Base de datos en la nube (Supabase)
 # Nota: fijamos <2.22 porque a partir de esa version storage3 arrastra pyiceberg,
