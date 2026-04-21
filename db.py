@@ -254,6 +254,115 @@ def ping() -> dict[str, Any]:
         return {"conectado": False, "cantidad_filas": 0, "error": str(exc)}
 
 
+# ---------------------------------------------------------------------------
+# Helpers especificos para el dashboard v2 (Bloomberg redesign)
+# ---------------------------------------------------------------------------
+# Estos wrappers enriquecen query_lineup con:
+#  - Filtrado a productos prioritarios (8 productos del trading desk).
+#  - Solo exportaciones (ops = "LOAD") porque el usuario no quiere imports.
+#  - Normalizacion de shippers (agrega columnas shipper_canon y origen_alt).
+#  - Agregaciones comunes para KPIs.
+
+def query_exports_prioritarios(
+    fecha_desde: date | None = None,
+    fecha_hasta: date | None = None,
+) -> pd.DataFrame:
+    """
+    Trae solo exportaciones (LOAD) de los 8 productos prioritarios.
+    Agrega las columnas `shipper_canon` y `origen_alt` ya normalizadas.
+
+    Es la base para Panorama, Shippers y Productos.
+    """
+    from config import CODIGOS_PRIORITARIOS
+    from shipper_norm import aplicar_a_dataframe
+
+    df = query_lineup(
+        fecha_desde=fecha_desde,
+        fecha_hasta=fecha_hasta,
+        cargos=list(CODIGOS_PRIORITARIOS),
+    )
+    if df.empty:
+        return df
+
+    # Solo exportaciones (LOAD). El usuario no quiere imports en el dashboard.
+    df = df[df["ops"] == "LOAD"].copy()
+
+    # Normalizar shippers (agrega shipper_canon y origen_alt).
+    df = aplicar_a_dataframe(df)
+    return df
+
+
+def query_en_puerto_ahora(fecha_ref: date) -> pd.DataFrame:
+    """
+    Buques actualmente en puerto: etb <= fecha_ref AND ets >= fecha_ref.
+
+    Si etb o ets son NULL, se excluyen (no podemos saber si esta operando).
+    Usa el line-up mas reciente disponible en DB (la query `lineup` tiene
+    una fila por dia-consulta-buque; para "ahora" usamos el ultimo snapshot).
+    """
+    client = get_client()
+    # Tomamos el snapshot del ultimo dia de consulta (fecha_ref).
+    # Los buques que aparecen ese dia con ETB ya pasado y ETS futuro = en puerto.
+    query = (
+        client.table(TABLA_LINEUP)
+        .select("*")
+        .eq("fecha_consulta", fecha_ref.isoformat())
+        .not_.is_("etb", "null")
+        .not_.is_("ets", "null")
+        .lte("etb", fecha_ref.isoformat())
+        .gte("ets", fecha_ref.isoformat())
+    )
+    filas = _fetch_all(query)
+    df = pd.DataFrame(filas)
+    if df.empty:
+        return df
+
+    for col in ("fecha_consulta", "eta", "etb", "ets"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+
+    return df
+
+
+def ultima_fecha_cargada() -> date | None:
+    """
+    Devuelve la fecha_consulta mas reciente en la tabla.
+    Util como default del selector de fecha en el dashboard.
+    """
+    client = get_client()
+    resp = (
+        client.table(TABLA_LINEUP)
+        .select("fecha_consulta")
+        .order("fecha_consulta", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not resp.data:
+        return None
+    valor = resp.data[0]["fecha_consulta"]
+    if isinstance(valor, str):
+        return datetime.strptime(valor, "%Y-%m-%d").date()
+    return valor
+
+
+def primera_fecha_cargada() -> date | None:
+    """Primera fecha_consulta en DB (borde del histograma)."""
+    client = get_client()
+    resp = (
+        client.table(TABLA_LINEUP)
+        .select("fecha_consulta")
+        .order("fecha_consulta", desc=False)
+        .limit(1)
+        .execute()
+    )
+    if not resp.data:
+        return None
+    valor = resp.data[0]["fecha_consulta"]
+    if isinstance(valor, str):
+        return datetime.strptime(valor, "%Y-%m-%d").date()
+    return valor
+
+
 if __name__ == "__main__":
     # Uso: python db.py  -> prueba de conexion
     print("Probando conexion a Supabase...")
