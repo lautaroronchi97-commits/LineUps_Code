@@ -473,11 +473,17 @@ with tab_pan:
             barmode="stack",
             labels={"fecha": "", "buques": "Buques", "estado": ""},
         )
+        # x=pd.Timestamp evita un TypeError en plotly al calcular la
+        # posicion de la anotacion sobre add_vline con datetime.date.
+        _hoy_ts = pd.Timestamp(fecha_ref)
         fig_b.add_vline(
-            x=fecha_ref, line_dash="dot",
+            x=_hoy_ts, line_dash="dot",
             line_color=BLOOMBERG_PALETTE["warning"],
-            annotation_text="Hoy",
-            annotation_font_color=BLOOMBERG_PALETTE["warning"],
+        )
+        fig_b.add_annotation(
+            x=_hoy_ts, y=1, yref="paper", showarrow=False,
+            text="Hoy", font=dict(color=BLOOMBERG_PALETTE["warning"]),
+            xanchor="left", yanchor="top",
         )
         aplicar_tema(fig_b)
         fig_b.update_layout(height=340, legend=dict(orientation="h", yanchor="bottom", y=1.02))
@@ -501,8 +507,9 @@ with tab_pan:
             name="MM 7d", mode="lines",
             line=dict(color=BLOOMBERG_PALETTE["accent_blue"], width=2),
         )
+        # pd.Timestamp para evitar el bug de _mean en plotly sobre date.
         fig_t.add_vline(
-            x=fecha_ref, line_dash="dot",
+            x=pd.Timestamp(fecha_ref), line_dash="dot",
             line_color=BLOOMBERG_PALETTE["warning"],
         )
         aplicar_tema(fig_t)
@@ -1262,8 +1269,9 @@ with tab_cng:
                     BLOOMBERG_PALETTE["warning"],
                 ],
             )
+            # pd.Timestamp para evitar el bug de _mean en plotly sobre date.
             fig_cong.add_vline(
-                x=fecha_ref, line_dash="dot",
+                x=pd.Timestamp(fecha_ref), line_dash="dot",
                 line_color=BLOOMBERG_PALETTE["warning"],
             )
             aplicar_tema(fig_cong)
