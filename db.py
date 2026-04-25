@@ -24,9 +24,11 @@ from supabase import Client, create_client
 
 from config import (
     FETCH_PAGE_SIZE,
+    TABLA_DJVE,
     TABLA_LINEUP,
     UPSERT_BATCH_SIZE,
     UPSERT_CONFLICT_COLUMNS,
+    UPSERT_CONFLICT_DJVE,
 )
 from utils import setup_logging
 
@@ -360,6 +362,113 @@ def primera_fecha_cargada() -> date | None:
     valor = resp.data[0]["fecha_consulta"]
     if isinstance(valor, str):
         return datetime.strptime(valor, "%Y-%m-%d").date()
+    return valor
+
+
+# ---------------------------------------------------------------------------
+# DJVE: persistencia y lectura
+# ---------------------------------------------------------------------------
+# Las DJVE (Declaraciones Juradas de Ventas al Exterior) las baja update_djve.py
+# del MAGyP cada dia. Se persisten en la tabla `djve` para que el dashboard
+# pueda leerlas rapido (en lugar de descargar el XLSX cada vez que el usuario
+# entra a la pestana Productos).
+
+def upsert_djve(filas: list[dict[str, Any]],
+                batch_size: int = UPSERT_BATCH_SIZE) -> int:
+    """
+    Inserta/actualiza filas en la tabla `djve`.
+
+    Idempotente: si la misma DJVE (anio, nro_djve) viene de nuevo en una
+    corrida posterior, se sobreescriben los campos en lugar de duplicar.
+
+    Args:
+        filas: lista de dicts con las keys de la tabla djve. Las filas deben
+            traer al menos `anio` y `nro_djve` (la unique constraint).
+        batch_size: tamano del lote para el upsert. Default 500 evita timeouts.
+
+    Returns:
+        Cantidad total de filas upserted.
+    """
+    if not filas:
+        return 0
+
+    client = get_client()
+    total = 0
+
+    for inicio in range(0, len(filas), batch_size):
+        lote = filas[inicio:inicio + batch_size]
+        try:
+            resp = (
+                client.table(TABLA_DJVE)
+                .upsert(lote, on_conflict=UPSERT_CONFLICT_DJVE)
+                .execute()
+            )
+        except Exception as exc:
+            logger.error(
+                "Upsert DJVE fallo en el lote %d-%d (%d filas): %s",
+                inicio, inicio + len(lote), len(lote), exc,
+            )
+            raise
+
+        total += len(resp.data) if resp.data else len(lote)
+        logger.info("Upsert DJVE OK: lote de %d filas (acumulado %d/%d).",
+                    len(lote), total, len(filas))
+
+    return total
+
+
+def query_djve(anio: int | None = None) -> pd.DataFrame:
+    """
+    Lee la tabla djve. Devuelve DataFrame con las mismas columnas que produce
+    fob_djve.descargar_djve_acumuladas (sin `id`, sin `actualizado_en`).
+
+    Args:
+        anio: si se pasa, filtra a ese ano. Si es None, trae todo.
+
+    Returns:
+        DataFrame vacio si no hay data.
+    """
+    client = get_client()
+    query = client.table(TABLA_DJVE).select(
+        "nro_djve, fecha_registro, fecha_presentacion, producto, toneladas, "
+        "fecha_inicio_embarque, fecha_fin_embarque, opcion, razon_social, "
+        "codigo_interno, anio"
+    )
+    if anio is not None:
+        query = query.eq("anio", anio)
+    query = query.order("fecha_registro", desc=False)
+
+    filas = _fetch_all(query)
+    df = pd.DataFrame(filas)
+    if df.empty:
+        return df
+
+    # Normalizar tipos para que matcheen con la salida de fob_djve.
+    for col in ("fecha_registro", "fecha_presentacion",
+                "fecha_inicio_embarque", "fecha_fin_embarque"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+    if "toneladas" in df.columns:
+        df["toneladas"] = pd.to_numeric(df["toneladas"], errors="coerce").fillna(0)
+
+    return df
+
+
+def djve_ultima_actualizacion(anio: int | None = None) -> datetime | None:
+    """
+    Devuelve el timestamp mas reciente del campo `actualizado_en` en la tabla
+    djve. Sirve para mostrar en el dashboard "ultima sync DJVE: hace X minutos".
+    """
+    client = get_client()
+    query = client.table(TABLA_DJVE).select("actualizado_en")
+    if anio is not None:
+        query = query.eq("anio", anio)
+    resp = query.order("actualizado_en", desc=True).limit(1).execute()
+    if not resp.data:
+        return None
+    valor = resp.data[0]["actualizado_en"]
+    if isinstance(valor, str):
+        return datetime.fromisoformat(valor.replace("Z", "+00:00"))
     return valor
 
 

@@ -22,6 +22,7 @@ Funciones publicas:
 from __future__ import annotations
 
 from datetime import date, timedelta
+from functools import lru_cache
 
 # ---------------------------------------------------------------------------
 # Configuracion: mes y dia de inicio de cada campana por producto.
@@ -66,6 +67,7 @@ def _inicio_campana(producto: str | None) -> tuple[int, int]:
     return CAMPANA_CONFIG.get(producto.upper().strip(), _DEFAULT_INICIO)
 
 
+@lru_cache(maxsize=8192)
 def campana_de(producto: str | None, fecha: date) -> str:
     """
     Devuelve la campana a la que pertenece una fecha, en formato "YYYY/YY".
@@ -75,6 +77,10 @@ def campana_de(producto: str | None, fecha: date) -> str:
         fecha=2025-02-15 -> "2024/25"  (arranco 1-mar-2024)
         fecha=2025-03-01 -> "2025/26"  (primer dia)
         fecha=2025-02-28 -> "2024/25"  (ultimo dia)
+
+    Cacheado con lru_cache: el dashboard la llama miles de veces sobre las
+    mismas fechas (mismo producto, mismas fechas en distintas filas) y la
+    funcion es pura, asi que cachear es gratis.
     """
     mes_ini, dia_ini = _inicio_campana(producto)
     if (fecha.month, fecha.day) >= (mes_ini, dia_ini):
@@ -84,6 +90,7 @@ def campana_de(producto: str | None, fecha: date) -> str:
     return f"{anio_inicio}/{str(anio_inicio + 1)[-2:]}"
 
 
+@lru_cache(maxsize=512)
 def fechas_de_campana(producto: str | None, campana: str) -> tuple[date, date]:
     """
     Devuelve (start, end) de una campana "YYYY/YY".
@@ -98,6 +105,7 @@ def fechas_de_campana(producto: str | None, campana: str) -> tuple[date, date]:
     return (inicio, fin)
 
 
+@lru_cache(maxsize=8192)
 def dia_de_campana(producto: str | None, fecha: date) -> int:
     """
     Numero de dia transcurrido dentro de la campana (1-indexed).

@@ -361,3 +361,12 @@ FETCH_PAGE_SIZE = 1000
 UPSERT_CONFLICT_COLUMNS = (
     "fecha_consulta,port,berth,vessel,cargo,quantity,eta,dest_orig,shipper,ops"
 )
+
+
+# Tabla djve: snapshot acumulado anual de las DJVE aprobadas del MAGyP.
+# La cargamos con update_djve.py (descarga el XLSX y upsertea por nro_djve).
+TABLA_DJVE = "djve"
+
+# Clave unica para upsert idempotente de DJVE: el mismo nro_djve en el mismo
+# anio se actualiza, no se duplica. Coincide con el unique index del DDL.
+UPSERT_CONFLICT_DJVE = "anio,nro_djve"
