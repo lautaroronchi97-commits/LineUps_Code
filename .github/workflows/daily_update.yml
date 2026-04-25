@@ -1,18 +1,25 @@
-name: Daily line-up update
+name: Daily line-up + DJVE update
 
-# Trigger manual solamente.
-# (El cron se removio porque los runners de GitHub Actions no pueden alcanzar
-# www.isa-agents.com.ar -- el server responde timeout a esas IPs. El update
-# diario corre via Programador de Tareas de Windows en la PC del usuario.)
-# Se puede disparar manualmente desde la pestana "Actions" del repo si se
-# configura un proxy o se corre desde una IP argentina.
+# Corre todos los dias a las 13:00 UTC = 10:00 ART (sin DST en AR).
+# Tambien se puede disparar manualmente desde la pestana "Actions" del repo.
+#
+# NOTA importante:
+# - DJVE (MAGyP) historicamente se descarga sin problemas desde runners de
+#   GitHub Actions: el server admite IPs de cloud.
+# - ISA (line_up_mndrn) en algun momento bloqueo IPs de GitHub Actions y
+#   por eso el cron estuvo desactivado. Lo reactivamos con `continue-on-error`
+#   para que un eventual bloqueo de ISA NO impida la actualizacion de DJVE.
+#   Si ISA bloquea sistematicamente, ver README -> "Fallback: scrapeo via
+#   Supabase Edge Function en sa-east-1".
 on:
+  schedule:
+    - cron: '0 13 * * *'   # 13:00 UTC = 10:00 ART todos los dias
   workflow_dispatch:
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout del repo
@@ -29,17 +36,41 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Correr update_today.py
+      # Paso 1: line-up de ISA. Marcado como continue-on-error porque
+      # historicamente ISA bloqueo IPs de GitHub Actions; si vuelve a
+      # bloquear, queremos que DJVE siga actualizandose.
+      - name: Update ISA (line-up portuario)
+        id: isa
+        continue-on-error: true
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python update_today.py --dias 3
+
+      # Paso 2: DJVE del MAGyP. Independiente del paso anterior.
+      - name: Update DJVE (MAGyP)
+        id: djve
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python update_djve.py
+
+      # Si ISA fallo, marcamos el job como warning (no failure) imprimiendo
+      # un mensaje claro. Asi el usuario sabe que ISA bloqueo pero DJVE OK.
+      - name: Reportar resultado
+        if: always()
+        run: |
+          echo "ISA outcome: ${{ steps.isa.outcome }}"
+          echo "DJVE outcome: ${{ steps.djve.outcome }}"
+          if [ "${{ steps.isa.outcome }}" != "success" ]; then
+            echo "::warning::ISA fallo. Probable bloqueo de IPs de GitHub Actions. Considerar plan B (Supabase Edge Function)."
+          fi
 
       - name: Subir logs como artifact (opcional, para debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scraper-logs-${{ github.run_id }}
-          path: logs/scraper.log
+          path: logs/
           retention-days: 7
           if-no-files-found: ignore
