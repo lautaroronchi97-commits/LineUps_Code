@@ -29,7 +29,7 @@ Arquitectura:
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 # En Streamlit Cloud no hay .env: los valores vienen de st.secrets.
 # Copiarlos a env vars ANTES de importar db.py (que los busca via os.getenv).
@@ -69,6 +69,7 @@ from db import (
     query_en_puerto_ahora,
     query_exports_prioritarios,
     query_lineup,
+    ultima_actualizacion_lineup,
     ultima_fecha_cargada,
 )
 from shipper_norm import SHIPPERS_TOP, aplicar_a_dataframe
@@ -182,6 +183,12 @@ def cached_ping() -> dict:
 @st.cache_data(ttl=60)
 def cached_ultima_fecha() -> date | None:
     return ultima_fecha_cargada()
+
+
+@st.cache_data(ttl=60)
+def cached_ultima_actualizacion() -> datetime | None:
+    """Timestamp de la ultima fila insertada en lineup (cron diario)."""
+    return ultima_actualizacion_lineup()
 
 
 @st.cache_data(ttl=600)
@@ -403,7 +410,7 @@ with st.sidebar:
         f"⚓ LINE-UP · AR</h2>",
         unsafe_allow_html=True,
     )
-    st.caption(f"{estado['cantidad_filas']:,} movimientos · fuente ISA Agents")
+    st.caption(f"{estado['cantidad_filas']:,} movimientos en base")
 
     st.divider()
 
@@ -439,15 +446,15 @@ with st.sidebar:
     )
     dias_atrasados = (date.today() - fecha_max_db).days
     if dias_atrasados >= 2:
-        # 2+ dias: probablemente ISA no publica (scraper corre todos los dias).
+        # 2+ dias: probable ausencia de publicacion de la fuente (scraper corre
+        # todos los dias). Suele pasar fines de semana / feriados.
         st.warning(
-            f"⚠ Ultima data ISA: {fecha_max_db} ({dias_atrasados} dias atras).  \n"
-            "ISA suele no publicar fines de semana/feriados. Si persiste varios "
-            "dias habiles seguidos, verificar manualmente en isa-agents.com.ar."
+            f"⚠ Ultima data: {fecha_max_db} ({dias_atrasados} dias atras).  \n"
+            "Suele no haber publicaciones fines de semana / feriados. Si persiste "
+            "varios dias habiles seguidos, revisar el cron diario."
         )
     elif dias_atrasados == 1:
-        # 1 dia: normal si hoy es lunes (sabado/domingo sin data) o si aun no
-        # se disparo el update del dia.
+        # 1 dia: normal si hoy es lunes o aun no corrio el update del dia.
         st.info(f"Ultima data: {fecha_max_db}. Update corre diario a las 10:00.")
 
 
@@ -456,7 +463,19 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 st.title("LINE-UP · PUERTOS ARGENTINOS")
+
+# Ultima actualizacion: timestamp del ultimo cron exitoso (max(created_at)
+# en lineup). Se muestra en horario ART (UTC-3, sin DST en AR) para que
+# el trader vea de un toque "que tan fresco esta esto".
+_ult_act = cached_ultima_actualizacion()
+if _ult_act is not None:
+    _art = _ult_act.astimezone(timezone(timedelta(hours=-3)))
+    _ult_act_str = _art.strftime('%d-%b-%Y %H:%M ART')
+else:
+    _ult_act_str = "sin datos"
+
 st.caption(
+    f"🔄 **Ultima actualizacion:** {_ult_act_str}  ·  "
     f"Trading desk · "
     f"{fecha_ref.strftime('%A %d-%b-%Y')} · "
     f"Campana MAIZE {campanas.campana_de('MAIZE', fecha_ref)} · "
@@ -729,10 +748,16 @@ def _render_shippers_tab():
 
     df_shp_all["fecha_consulta"] = pd.to_datetime(df_shp_all["fecha_consulta"])
 
-    # Sub-conjunto = ventana de analisis del usuario.
+    # Sub-conjunto = ventana de analisis. Aplicamos dedupe por buque para que
+    # las sumas de toneladas reflejen el FLUJO real (no se acumulan los
+    # snapshots repetidos del mismo buque). El z-score usa df_shp_all sin
+    # tocar; las sumas en esta vista usan df_shp_vent ya deduplicado.
     df_shp_vent = df_shp_all[
         df_shp_all["fecha_consulta"].dt.date >= fecha_ref - timedelta(days=ventana_dias)
     ]
+    df_shp_vent = df_shp_vent.sort_values("fecha_consulta").copy()
+    _ult_foto_shp = df_shp_vent.groupby("vessel")["fecha_consulta"].transform("max")
+    df_shp_vent = df_shp_vent[df_shp_vent["fecha_consulta"] == _ult_foto_shp]
 
     # ------------------- Ranking por shipper en la ventana -------------------
     st.subheader(f"Ranking top 10 · ultimos {ventana_dias} dias")
@@ -1034,15 +1059,29 @@ with tab_prd:
         st.info(f"Sin datos de {display_prd} en las ultimas 6 campanas.")
     else:
         df_prd["fecha_consulta"] = pd.to_datetime(df_prd["fecha_consulta"])
-        df_prd["fecha_day"] = df_prd["fecha_consulta"].dt.date
+
+        # Dedupe del line-up para metricas de FLUJO (toneladas embarcadas
+        # por dia/campana). Cada buque aparece en cada snapshot diario hasta
+        # que zarpa; sumar quantity a traves de fecha_consulta infla las
+        # toneladas ~10x. Solucion: para cada buque tomar la ultima foto
+        # (todas las sub-filas de splits a destinos/puertos quedan) y
+        # asignar el embarque al dia/campana de su ETB (fallback ETA o
+        # fecha_consulta). Asi un buque cuenta UNA vez, en su mes real de
+        # carga, aun si aparecio en 30 snapshots.
+        df_prd = df_prd.sort_values("fecha_consulta")
+        ult_foto_prd = df_prd.groupby("vessel")["fecha_consulta"].transform("max")
+        df_prd = df_prd[df_prd["fecha_consulta"] == ult_foto_prd].copy()
+        df_prd["fecha_carga"] = pd.to_datetime(
+            df_prd["etb"].fillna(df_prd["eta"]).fillna(df_prd["fecha_consulta"])
+        ).dt.date
+
         # PERF: evitamos `.apply` por fila (ejecutaria campana_de cientos de
-        # miles de veces). En su lugar mapeamos sobre las fechas unicas
-        # (~365 × 6 = ~2200 fechas) y propagamos con `.map`. ~30× mas rapido.
-        fechas_unicas = pd.Series(df_prd["fecha_day"].unique())
+        # veces). Mapeamos sobre las fechas unicas y propagamos con `.map`.
+        fechas_unicas = pd.Series(df_prd["fecha_carga"].unique())
         mapa_camp = {f: campanas.campana_de(codigo_prd, f) for f in fechas_unicas}
         mapa_dia = {f: campanas.dia_de_campana(codigo_prd, f) for f in fechas_unicas}
-        df_prd["campana"] = df_prd["fecha_day"].map(mapa_camp)
-        df_prd["dia_campana"] = df_prd["fecha_day"].map(mapa_dia)
+        df_prd["campana"] = df_prd["fecha_carga"].map(mapa_camp)
+        df_prd["dia_campana"] = df_prd["fecha_carga"].map(mapa_dia)
 
         # ------------------- KPIs -------------------
         df_actual = df_prd[df_prd["campana"] == campana_actual]
@@ -1675,6 +1714,5 @@ with tab_cng:
 
 st.divider()
 st.caption(
-    f"Line-Up AR · v2 Bloomberg · data {fecha_min_db} → {fecha_max_db} · "
-    "fuente: [ISA Agents](https://www.isa-agents.com.ar/info/line_up_mndrn.php)"
+    f"Line-Up AR · v2 Bloomberg · data {fecha_min_db} → {fecha_max_db}"
 )

@@ -365,6 +365,30 @@ def primera_fecha_cargada() -> date | None:
     return valor
 
 
+def ultima_actualizacion_lineup() -> datetime | None:
+    """
+    Timestamp de la ultima fila insertada en la tabla `lineup`. Refleja
+    cuando corrio el ultimo update exitoso (cron diario o manual). Util
+    para mostrarle al usuario "Ultima actualizacion: dd-mm hh:mm".
+    """
+    client = get_client()
+    resp = (
+        client.table(TABLA_LINEUP)
+        .select("created_at")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not resp.data:
+        return None
+    valor = resp.data[0]["created_at"]
+    if isinstance(valor, str):
+        # Postgres devuelve timestamp con TZ ("...+00:00"). datetime.fromisoformat
+        # de Python 3.11+ lo parsea bien.
+        return datetime.fromisoformat(valor.replace("Z", "+00:00"))
+    return valor
+
+
 # ---------------------------------------------------------------------------
 # DJVE: persistencia y lectura
 # ---------------------------------------------------------------------------
