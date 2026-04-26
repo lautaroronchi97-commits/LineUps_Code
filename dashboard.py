@@ -1474,7 +1474,10 @@ with tab_prd:
 
                 # Grafico de barras: ultimas 6 campanas.
                 ult_asc = ult.sort_values("campania", ascending=True).reset_index(drop=True)
-                color_estim = PRODUCTO_DISPLAY.get(codigo_prd, (display_prd, BLOOMBERG_PALETTE["accent"]))[1]
+                # Color del cultivo. PRODUCTO_DISPLAY mapea codigo -> nombre
+                # (string), no es un mapa de colores; usamos el accent del
+                # tema Bloomberg como color por defecto del cultivo.
+                color_estim = BLOOMBERG_PALETTE["accent"]
 
                 fig_estim = go.Figure()
                 fig_estim.add_bar(
