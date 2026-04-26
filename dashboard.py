@@ -518,14 +518,14 @@ tab_pan, tab_shp, tab_prd, tab_cng = st.tabs([
 # PESTANA 1: PANORAMA
 # ==========================================================================
 
-with tab_pan:
+def _render_panorama_tab():
     # Traer 90 dias para poder calcular tendencias y promedios moviles.
     desde = fecha_ref - timedelta(days=90)
     df_panorama = cached_exports_rango(desde, fecha_ref)
 
     if df_panorama.empty:
         st.info(f"Sin datos entre {desde} y {fecha_ref}.")
-        st.stop()
+        return
 
     df_panorama["fecha_consulta"] = pd.to_datetime(df_panorama["fecha_consulta"])
     df_panorama["estado"] = df_panorama["remarks"].apply(clasificar_estado)
@@ -668,9 +668,19 @@ with tab_pan:
             f"Prom {ventana_dias}d": fmt_tons(tons_p_prom),
             "vs prom":        pct_change(tons_p_hoy, tons_p_prom),
             "Campana":        camp_actual,
+            # Columna interna para ordenar por valor numerico real, ya que la
+            # columna "Tons hoy" esta formateada como string ("46K").
+            "_tons_hoy_raw":  float(tons_p_hoy or 0),
         })
 
     df_resumen = pd.DataFrame(resumen_rows)
+    # Default: ordenar por toneladas hoy (DESC) — lo que el trader quiere ver
+    # primero son los productos mas activos del dia, no el orden alfabetico.
+    df_resumen = (
+        df_resumen.sort_values("_tons_hoy_raw", ascending=False)
+        .drop(columns="_tons_hoy_raw")
+        .reset_index(drop=True)
+    )
     st.dataframe(df_resumen, use_container_width=True, hide_index=True, height=320)
 
     st.divider()
@@ -708,14 +718,14 @@ with tab_pan:
 # PESTANA 2: SHIPPERS (core)
 # ==========================================================================
 
-with tab_shp:
+def _render_shippers_tab():
     # Traemos ~2 anos para poder calcular historia por shipper con robustez.
     desde_shp = fecha_ref - timedelta(days=730)
     df_shp_all = cached_exports_rango(desde_shp, fecha_ref)
 
     if df_shp_all.empty:
         st.info("Sin data historica suficiente.")
-        st.stop()
+        return
 
     df_shp_all["fecha_consulta"] = pd.to_datetime(df_shp_all["fecha_consulta"])
 
@@ -822,6 +832,95 @@ with tab_shp:
 
     st.divider()
 
+    # ------------------- Actividad mensual top 10 · ultimos 3 meses -------
+    # Vista dinamica de "quien se mueve esta semana/mes". El z-score de mas
+    # arriba es buena senal estadistica pero no le dice al trader quien
+    # embarco mas TONELADAS hoy. Esta tabla responde: cuanto tonelaje cargo
+    # cada shipper en los ultimos 3 meses, y como se compara contra el mes
+    # anterior (Δ MoM) y contra el mismo mes hace 12 meses (Δ YoY).
+    st.subheader("Actividad mensual top 10 · ultimos 3 meses")
+    st.caption(
+        "Toneladas por shipper en los ultimos 3 meses. Δ MoM = variacion vs "
+        "mes anterior. Δ YoY = variacion vs mismo mes hace 12 meses."
+    )
+
+    hoy_per_shp = pd.Period(fecha_ref, freq="M")
+    periodos_3 = [(hoy_per_shp - i) for i in range(2, -1, -1)]
+    yoy_per = hoy_per_shp - 12
+
+    # Dedupe: tomar la ultima foto por buque (mismo motivo que en waterfall:
+    # un buque aparece en cada snapshot diario hasta que zarpa). Asignar al
+    # mes de carga via ETB (fallback ETA/fecha_consulta).
+    df_shp_mes = df_shp_all.copy()
+    df_shp_mes = df_shp_mes.sort_values("fecha_consulta")
+    ult_foto_shp = df_shp_mes.groupby("vessel")["fecha_consulta"].transform("max")
+    df_shp_mes = df_shp_mes[df_shp_mes["fecha_consulta"] == ult_foto_shp]
+    df_shp_mes["mes_carga"] = pd.to_datetime(
+        df_shp_mes["etb"].fillna(df_shp_mes["eta"]).fillna(df_shp_mes["fecha_consulta"])
+    ).dt.to_period("M")
+    pivot_mes = (
+        df_shp_mes.groupby(["shipper_canon", "mes_carga"])["quantity"].sum()
+        .unstack(fill_value=0)
+    )
+    pivot_top = pivot_mes.reindex(SHIPPERS_TOP).fillna(0)
+
+    def _safe(row, key):
+        return float(row[key]) if key in row.index else 0.0
+
+    filas_mes = []
+    label_anterior = f"{periodos_3[0].strftime('%b')} {periodos_3[0].year % 100:02d}"
+    label_prev = f"{periodos_3[1].strftime('%b')} {periodos_3[1].year % 100:02d}"
+    label_actual = f"{periodos_3[2].strftime('%b')} {periodos_3[2].year % 100:02d}"
+    for shipper, row in pivot_top.iterrows():
+        v_act = _safe(row, periodos_3[2])
+        v_prev = _safe(row, periodos_3[1])
+        v_ant = _safe(row, periodos_3[0])
+        v_yoy = _safe(row, yoy_per)
+        delta_mom = ((v_act - v_prev) / v_prev * 100) if v_prev else None
+        delta_yoy = ((v_act - v_yoy) / v_yoy * 100) if v_yoy else None
+        filas_mes.append({
+            "Shipper":      shipper,
+            label_anterior: fmt_tons(v_ant),
+            label_prev:     fmt_tons(v_prev),
+            label_actual:   fmt_tons(v_act),
+            "Δ MoM": (f"{delta_mom:+.0f}%" if delta_mom is not None else "—"),
+            "Δ YoY": (f"{delta_yoy:+.0f}%" if delta_yoy is not None else "—"),
+            "_sort": v_act,
+        })
+
+    df_mes_table = (
+        pd.DataFrame(filas_mes)
+        .sort_values("_sort", ascending=False)
+        .drop(columns="_sort")
+        .reset_index(drop=True)
+    )
+    st.dataframe(df_mes_table, use_container_width=True, hide_index=True, height=380)
+
+    # Chart: grouped bar de los top 6 shippers por toneladas del mes actual.
+    top6 = df_mes_table.head(6)["Shipper"].tolist()
+    fig_mes_shp = go.Figure()
+    mes_labels = [
+        f"{p.strftime('%b')} {p.year % 100:02d}" for p in periodos_3
+    ]
+    for shipper in top6:
+        valores = [
+            float(pivot_top.loc[shipper, p]) if p in pivot_top.columns else 0.0
+            for p in periodos_3
+        ]
+        fig_mes_shp.add_bar(
+            x=mes_labels, y=valores, name=shipper,
+            marker_color=SHIPPER_COLORS.get(shipper, SHIPPER_COLORS["OTROS"]),
+        )
+    aplicar_tema(fig_mes_shp)
+    fig_mes_shp.update_layout(
+        height=360, barmode="group",
+        yaxis_title="Toneladas",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig_mes_shp, use_container_width=True)
+
+    st.divider()
+
     # ------------------- Drill-down: shipper seleccionado -------------------
     st.subheader("Drill-down por shipper")
     shipper_sel = st.selectbox(
@@ -879,6 +978,19 @@ with tab_shp:
             height=300, title=f"{shipper_sel} · mix de productos (total historico ventana)",
         )
         st.plotly_chart(fig_mix, use_container_width=True)
+
+
+# ==========================================================================
+# Render de las pestanas refactoreadas a funciones (PANORAMA y SHIPPERS).
+# Se hace aca para que la definicion de las funciones quede arriba en el
+# archivo y la ejecucion de los tabs siga el orden visual del usuario.
+# ==========================================================================
+
+with tab_pan:
+    _render_panorama_tab()
+
+with tab_shp:
+    _render_shippers_tab()
 
 
 # ==========================================================================
@@ -947,11 +1059,37 @@ with tab_prd:
         tons_mediana_hist = np.median(acumulados_hist) if acumulados_hist else 0
         tons_promedio_hist = np.mean(acumulados_hist) if acumulados_hist else 0
 
+        # KPI "% Produccion MAGyP embarcado": traer estimacion del MAGyP para
+        # la ultima campana cerrada del producto y calcular cuanta produccion
+        # ya se embarco. Es el indicador de posicion en la curva de campana
+        # (% en la curva de embarque de produccion total esperada).
+        prod_magyp_tm = None
+        prod_magyp_camp = None
+        df_estim_kpi = cached_estimaciones()
+        if not df_estim_kpi.empty:
+            tot_kpi = estim_mod.totales_nacionales_por_campania(df_estim_kpi)
+            cand = tot_kpi[tot_kpi["codigo_interno"] == codigo_prd].sort_values(
+                "campania", ascending=False
+            )
+            if not cand.empty:
+                prod_magyp_tm = float(cand.iloc[0]["produccion_tm"])
+                prod_magyp_camp = cand.iloc[0]["campania"]
+
+        pct_magyp = (tons_actual / prod_magyp_tm * 100) if prod_magyp_tm else None
+
         k1, k2, k3, k4 = st.columns(4)
         k1.metric(f"Acumulado {campana_actual} a hoy", fmt_tons(tons_actual))
         k2.metric("Mediana ultimas 5", fmt_tons(tons_mediana_hist))
-        k3.metric("Promedio ultimas 5", fmt_tons(tons_promedio_hist))
-        k4.metric("vs mediana", pct_change(tons_actual, tons_mediana_hist))
+        k3.metric("vs mediana", pct_change(tons_actual, tons_mediana_hist))
+        if pct_magyp is not None:
+            k4.metric(
+                "% prod MAGyP",
+                f"{pct_magyp:.1f}%",
+                delta=f"{prod_magyp_tm/1_000_000:.1f} Mt ({prod_magyp_camp})",
+                delta_color="off",
+            )
+        else:
+            k4.metric("Promedio ultimas 5", fmt_tons(tons_promedio_hist))
 
         st.divider()
 
@@ -1120,6 +1258,109 @@ with tab_prd:
                         legend=dict(orientation="h", yanchor="bottom", y=1.02),
                     )
                     st.plotly_chart(fig_djve, use_container_width=True)
+
+        # ------------------- Waterfall: DJVE vs Line-up (la "panza") ----------
+        # Cruce mensual entre lo VENDIDO (DJVE registrada) y lo EMBARCADO
+        # (line-up cargado). La diferencia es la panza de oferta pendiente:
+        # ventas comprometidas que aun no se cargaron y van a presionar
+        # precios cuando se acerquen a delivery. Es la pregunta que el trader
+        # hace todos los dias y antes habia que restar mentalmente entre dos
+        # graficos separados.
+        if not df_djve.empty:
+            st.divider()
+            st.subheader(f"Oferta pendiente · DJVE vs embarcado · {display_prd}")
+            st.caption(
+                "Ventas declaradas (DJVE) vs cargas en line-up por mes. "
+                "Pendiente = DJVE - Embarcado: ventas que faltan cargar. "
+                "Pico de pendiente anticipa presion de precios."
+            )
+
+            # Ultimos 6 meses incluyendo el actual.
+            hoy_periodo = pd.Period(fecha_ref, freq="M")
+            periodos = [(hoy_periodo - i) for i in range(5, -1, -1)]
+
+            # DJVE mensual filtrado por producto seleccionado.
+            dj_prd = df_djve[df_djve["codigo_interno"] == codigo_prd].copy()
+            if not dj_prd.empty:
+                dj_prd["mes"] = pd.to_datetime(dj_prd["fecha_registro"]).dt.to_period("M")
+                djve_mensual = (
+                    dj_prd.groupby("mes")["toneladas"].sum()
+                    .reindex(periodos, fill_value=0)
+                )
+            else:
+                djve_mensual = pd.Series(0, index=periodos, dtype=float)
+
+            # Line-up mensual: hay que deduplicar antes de sumar. Un mismo
+            # buque aparece en cada snapshot diario hasta que zarpa, asi que
+            # sumar todos los `fecha_consulta` infla las toneladas ~10x. La
+            # solucion: para cada buque tomar SOLO la ultima foto (el resto
+            # son repeticiones del mismo cargo) y asignar el embarque al mes
+            # de su ETB (fallback ETA o fecha_consulta).
+            lu_prd = df_prd.copy()
+            lu_prd = lu_prd.sort_values("fecha_consulta")
+            ultima_foto = lu_prd.groupby("vessel")["fecha_consulta"].transform("max")
+            lu_prd = lu_prd[lu_prd["fecha_consulta"] == ultima_foto]
+            lu_prd["mes_carga"] = pd.to_datetime(
+                lu_prd["etb"].fillna(lu_prd["eta"]).fillna(lu_prd["fecha_consulta"])
+            ).dt.to_period("M")
+            lineup_mensual = (
+                lu_prd.groupby("mes_carga")["quantity"].sum()
+                .reindex(periodos, fill_value=0)
+            )
+
+            # Pendiente = max(0, DJVE - Line-up). Clip a 0 porque a veces el
+            # line-up acumula carga de DJVE de meses anteriores (la pendiente
+            # negativa no es informacion accionable).
+            pendiente = (djve_mensual - lineup_mensual).clip(lower=0)
+
+            # Labels legibles: "Abr 26" en lugar de "2026-04".
+            labels = [f"{p.strftime('%b')} {p.year % 100:02d}" for p in periodos]
+
+            fig_wf = go.Figure()
+            fig_wf.add_bar(
+                x=labels, y=djve_mensual.values,
+                name="DJVE registrada",
+                marker_color=BLOOMBERG_PALETTE["accent_blue"],
+                text=[fmt_tons(v) for v in djve_mensual.values],
+                textposition="outside",
+            )
+            fig_wf.add_bar(
+                x=labels, y=lineup_mensual.values,
+                name="Line-up cargado",
+                marker_color=BLOOMBERG_PALETTE["accent"],
+                text=[fmt_tons(v) for v in lineup_mensual.values],
+                textposition="outside",
+            )
+            fig_wf.add_bar(
+                x=labels, y=pendiente.values,
+                name="Pendiente (panza)",
+                marker_color=BLOOMBERG_PALETTE["negative"],
+                text=[fmt_tons(v) if v > 0 else "" for v in pendiente.values],
+                textposition="outside",
+            )
+            aplicar_tema(fig_wf)
+            fig_wf.update_layout(
+                height=380,
+                barmode="group",
+                yaxis_title="Toneladas",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_wf, use_container_width=True)
+
+            # KPI sintetico: pendiente acumulada en los 6 meses + ratio.
+            total_djve = float(djve_mensual.sum())
+            total_lineup = float(lineup_mensual.sum())
+            total_pend = float(pendiente.sum())
+            ratio_pend = (total_pend / total_djve * 100) if total_djve else 0
+            wk1, wk2, wk3 = st.columns(3)
+            wk1.metric("DJVE 6 meses", fmt_tons(total_djve))
+            wk2.metric("Embarcado 6 meses", fmt_tons(total_lineup))
+            wk3.metric(
+                "Pendiente acumulado",
+                fmt_tons(total_pend),
+                delta=f"{ratio_pend:.0f}% de DJVE sin cargar",
+                delta_color="inverse",
+            )
 
         # ------------------- Top shippers de este producto -------------------
         st.divider()

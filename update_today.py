@@ -67,8 +67,16 @@ def main() -> int:
     logger.info("Update terminado: %d filas total, %d fechas fallidas.",
                 total_filas, total_fallas)
 
-    # Exit code 1 si todas las fechas fallaron: GitHub Actions marca el job como failed.
-    return 1 if total_fallas == len(fechas) else 0
+    # Exit code: una falla aislada (network blip, dia sin datos) no rompe el
+    # cron, pero si fallo la mayoria de fechas hay un problema sistematico
+    # (auth, scraper roto, ISA caido) y queremos que GitHub Actions lo
+    # marque como failed para que la notificacion llegue.
+    if total_fallas > 0:
+        logger.warning("FALLO PARCIAL: %d de %d fechas fallaron.",
+                       total_fallas, len(fechas))
+    if total_fallas > len(fechas) // 2:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

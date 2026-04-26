@@ -26,11 +26,21 @@ Si en el futuro el MAGyP agrega esos campos, extender _ESQUEMA_COLUMNAS.
 from __future__ import annotations
 
 import io
+import logging
+import time
 from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
 import requests
+
+# Reintentos para mitigar 403/timeouts puntuales de MAGyP. Si MAGyP cae,
+# preferimos devolver DataFrame vacio (downstream lo tolera) en lugar de
+# cortar el update diario.
+_MAX_RETRIES = 2
+_RETRY_BACKOFF = 3  # segundos entre reintentos
+
+_logger = logging.getLogger(__name__)
 
 # URL base (solo cambia el ano al final del nombre).
 BASE_URL_DJVE = (
@@ -147,13 +157,10 @@ def descargar_djve_acumuladas(
         anio = date.today().year
 
     url = BASE_URL_DJVE.format(anio=anio)
-    try:
-        resp = requests.get(url, headers=_HEADERS, timeout=timeout)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException:
+    contenido = _bajar_xlsx_con_retry(url, timeout=timeout, descripcion=f"DJVE {anio}")
+    if contenido is None:
         return pd.DataFrame()
-
-    return _parsear_xlsx(resp.content)
+    return _parsear_xlsx(contenido)
 
 
 def descargar_djve_actual(timeout: int = 30) -> pd.DataFrame:
@@ -161,13 +168,36 @@ def descargar_djve_actual(timeout: int = 30) -> pd.DataFrame:
     Descarga el XLSX "actual_aprobadas" (ultimas DJVE aprobadas en el dia).
     Mas rapido que el acumulado; util para refresh intra-day.
     """
-    try:
-        resp = requests.get(URL_DJVE_ACTUAL, headers=_HEADERS, timeout=timeout)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException:
+    contenido = _bajar_xlsx_con_retry(URL_DJVE_ACTUAL, timeout=timeout,
+                                      descripcion="DJVE actual")
+    if contenido is None:
         return pd.DataFrame()
+    return _parsear_xlsx(contenido)
 
-    return _parsear_xlsx(resp.content)
+
+def _bajar_xlsx_con_retry(url: str, timeout: int, descripcion: str) -> bytes | None:
+    """
+    Descarga un XLSX de MAGyP con reintentos. Devuelve los bytes o None si
+    fallo definitivamente. MAGyP a veces devuelve 403 transitorio o se queda
+    colgado; un reintento simple lo soluciona en la mayoria de los casos.
+    """
+    ultimo_error: Exception | None = None
+    for intento in range(1, _MAX_RETRIES + 2):
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            return resp.content
+        except requests.exceptions.RequestException as exc:
+            ultimo_error = exc
+            if intento <= _MAX_RETRIES:
+                _logger.warning(
+                    "Error bajando %s (intento %d/%d): %s. Reintento en %ds...",
+                    descripcion, intento, _MAX_RETRIES + 1, exc, _RETRY_BACKOFF,
+                )
+                time.sleep(_RETRY_BACKOFF)
+            else:
+                _logger.error("Fallo definitivo bajando %s: %s", descripcion, exc)
+    return None
 
 
 def _parsear_xlsx(contenido: bytes) -> pd.DataFrame:
