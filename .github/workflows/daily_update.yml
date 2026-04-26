@@ -16,6 +16,12 @@ on:
     - cron: '0 13 * * *'   # 13:00 UTC = 10:00 ART todos los dias
   workflow_dispatch:
 
+# Permisos minimos del GITHUB_TOKEN: el workflow solo lee el repo y sube
+# logs como artifact (no escribe codigo, no hace releases, no toca PRs).
+# Reduce el blast radius si una dep maliciosa intenta usar el token.
+permissions:
+  contents: read
+
 jobs:
   update:
     runs-on: ubuntu-latest

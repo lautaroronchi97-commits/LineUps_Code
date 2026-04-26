@@ -206,6 +206,13 @@ def _parsear_xlsx(contenido: bytes) -> pd.DataFrame:
     Si la estructura cambio (nombres de columnas distintos), devuelve DataFrame
     vacio en vez de pinchar.
     """
+    # Defensa XXE: rechazamos XLSX con DOCTYPE o ENTITY (vector clasico de
+    # XML External Entity attack). MAGyP es fuente confiable y openpyxl
+    # moderno no expande entidades por default, pero defendemos en
+    # profundidad por si MAGyP es comprometido o cambian la implementacion.
+    if b"<!DOCTYPE" in contenido or b"<!ENTITY" in contenido:
+        _logger.error("XLSX rechazado: contiene DOCTYPE/ENTITY (posible XXE).")
+        return pd.DataFrame()
     try:
         df = pd.read_excel(io.BytesIO(contenido), engine="openpyxl")
     except Exception:

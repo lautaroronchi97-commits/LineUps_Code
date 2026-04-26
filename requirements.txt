@@ -1,25 +1,31 @@
 # Scraping
+# Pinneamos un upper bound en cada dep para que un release con CVE no
+# entre automaticamente. Antes de aflojar un upper bound revisar el
+# changelog de la lib y los CVEs en https://nvd.nist.gov.
 requests>=2.32,<3
 beautifulsoup4>=4.12,<5
-lxml>=5.3
+# lxml<6 evita la 6.x hasta validar que el parser de scraper.py siga
+# comportandose igual (aparte de protegernos de XXE en versiones viejas).
+lxml>=5.3,<6
 
 # Datos
-pandas>=2.2
-python-dateutil>=2.9
+pandas>=2.2,<3
+python-dateutil>=2.9,<3
 # openpyxl necesario para leer los XLSX del MAGyP (DJVE).
-openpyxl>=3.1
+# >=3.1.3 mitiga XXE; <3.2 evita upgrades automaticos sin revisar.
+openpyxl>=3.1.3,<3.2
 
 # Base de datos en la nube (Supabase)
 # Nota: fijamos <2.22 porque a partir de esa version storage3 arrastra pyiceberg,
 # que no tiene wheels para Python 3.14 y requiere MSVC para compilarse.
 # La API del cliente es la misma en este rango.
 supabase>=2.15,<2.22
-python-dotenv>=1.0
+python-dotenv>=1.0,<2
 
 # Dashboard web
-streamlit>=1.39
+streamlit>=1.39,<2
 # plotly<6: evitamos plotly 6.x hasta validar que add_vline con date funciona.
 plotly>=5.24,<6
 
 # Utilidades
-tqdm>=4.66
+tqdm>=4.66,<5
