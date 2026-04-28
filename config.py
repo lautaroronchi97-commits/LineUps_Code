@@ -129,17 +129,19 @@ SHIPPER_COLORS: dict[str, str] = {
 
 # Paleta Bloomberg (para elementos generales del dashboard).
 BLOOMBERG_PALETTE = {
-    "bg_primary":   "#0A0E1A",   # fondo principal
-    "bg_card":      "#141B2B",   # cards/containers
-    "bg_hover":     "#1E2738",
-    "accent":       "#FF9900",   # amber signature Bloomberg
-    "accent_blue":  "#00D4FF",
-    "positive":     "#00FF88",
-    "negative":     "#FF3B3B",
-    "warning":      "#FFCC00",
-    "text_primary": "#E1E5EE",
-    "text_muted":   "#8899AA",
-    "grid":         "#1A2332",
+    "bg_primary":   "#08080f",   # fondo principal (casi negro, leve tinte azul)
+    "bg_card":      "#0e0e1a",   # cards/containers/panels
+    "bg_hover":     "#16162a",
+    "accent":       "#e06010",   # naranja terminal (acento principal)
+    "accent_blue":  "#6655ee",   # azul eléctrico (sparklines, datos secundarios)
+    "positive":     "#00cc66",   # verde (precios arriba, positivo)
+    "negative":     "#ff3333",   # rojo (precios abajo, negativo)
+    "warning":      "#e8a800",   # ámbar (advertencias, hoy)
+    "text_primary": "#c8c8d4",   # texto principal
+    "text_muted":   "#50505f",   # texto secundario / labels
+    "grid":         "#14141f",   # líneas de grilla y bordes
+    "border":       "#1e1e2e",   # bordes de cards
+    "top_stripe":   "#b83000",   # franja superior (cobre/óxido)
 }
 
 

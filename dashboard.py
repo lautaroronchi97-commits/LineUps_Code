@@ -136,49 +136,217 @@ def aplicar_tema(fig: go.Figure) -> go.Figure:
     return fig
 
 
-# CSS inyectado para afinar detalles Bloomberg que el tema Streamlit no cubre.
+# =============================================================================
+# CSS GLOBAL — estilo terminal de trading (inspirado en Fintelligentia)
+# =============================================================================
+_P = BLOOMBERG_PALETTE  # alias corto
+
 st.markdown(
     f"""
     <style>
-    /* Tabla de numeros con alineacion a la derecha (look Bloomberg). */
-    [data-testid="stDataFrame"] table {{ font-family: Consolas, Menlo, monospace; }}
+    /* ---- Fuente: Google Fonts JetBrains Mono (fallback consolas) ---------- */
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&display=swap');
 
-    /* KPI metric cards con borde amber sutil. */
-    [data-testid="stMetric"] {{
-        background: {BLOOMBERG_PALETTE["bg_card"]};
-        border: 1px solid {BLOOMBERG_PALETTE["grid"]};
-        border-radius: 4px;
-        padding: 12px 16px;
-    }}
-    [data-testid="stMetricValue"] {{
-        color: {BLOOMBERG_PALETTE["accent"]};
-        font-family: Consolas, Menlo, monospace;
-        font-size: 28px !important;
-        font-weight: 700;
-    }}
-    [data-testid="stMetricLabel"] {{
-        color: {BLOOMBERG_PALETTE["text_muted"]};
-        text-transform: uppercase;
-        font-size: 11px !important;
-        letter-spacing: 0.08em;
+    html, body, [class*="css"], [data-testid], .stApp {{
+        font-family: 'JetBrains Mono', 'Consolas', 'Menlo', monospace !important;
     }}
 
-    /* Header: linea amber bajo el titulo, estilo terminal. */
+    /* ---- Franja superior cobre/óxido (Fintelligentia signature) ----------- */
+    .stApp::before {{
+        content: '';
+        display: block;
+        position: fixed;
+        top: 0; left: 0; right: 0;
+        height: 3px;
+        background: {_P["top_stripe"]};
+        z-index: 9999;
+    }}
+
+    /* ---- Fondo y superficie base ----------------------------------------- */
+    .stApp {{ background-color: {_P["bg_primary"]}; }}
+    [data-testid="stSidebar"] {{ background-color: {_P["bg_card"]} !important; }}
+    [data-testid="stSidebar"] * {{ border-color: {_P["border"]} !important; }}
+
+    /* ---- Headings --------------------------------------------------------- */
     h1 {{
-        border-bottom: 2px solid {BLOOMBERG_PALETTE["accent"]};
-        padding-bottom: 8px;
-        font-family: Consolas, Menlo, monospace !important;
+        font-size: 15px !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+        color: {_P["text_primary"]} !important;
+        border-bottom: 1px solid {_P["top_stripe"]};
+        padding-bottom: 10px;
+        margin-bottom: 12px;
+    }}
+    h2 {{
+        font-size: 12px !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: {_P["accent"]} !important;
+        margin-top: 8px !important;
+    }}
+    h3 {{
+        font-size: 11px !important;
+        font-weight: 400 !important;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: {_P["text_muted"]} !important;
     }}
 
-    /* Tabs con mas contraste. */
-    [data-baseweb="tab-list"] {{ gap: 4px; }}
-    [data-baseweb="tab"] {{
-        background: {BLOOMBERG_PALETTE["bg_card"]};
+    /* ---- Divider: línea sutil --------------------------------------------- */
+    hr {{
+        border: none !important;
+        border-top: 1px solid {_P["border"]} !important;
+        margin: 16px 0 !important;
+    }}
+
+    /* ---- Caption ---------------------------------------------------------- */
+    .stCaption, .stCaption p {{
+        font-size: 10px !important;
+        color: {_P["text_muted"]} !important;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+    }}
+
+    /* ---- KPI Metric cards ------------------------------------------------- */
+    [data-testid="stMetric"] {{
+        background: {_P["bg_card"]};
+        border: 1px solid {_P["border"]};
         border-radius: 2px;
+        padding: 14px 16px 10px !important;
+    }}
+    [data-testid="stMetricLabel"] > div {{
+        color: {_P["text_muted"]} !important;
+        text-transform: uppercase;
+        font-size: 9px !important;
+        letter-spacing: 0.10em;
+        font-weight: 600;
+    }}
+    [data-testid="stMetricValue"] > div {{
+        color: {_P["accent"]} !important;
+        font-size: 22px !important;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+    }}
+    [data-testid="stMetricDelta"] > div {{
+        font-size: 10px !important;
+        letter-spacing: 0.04em;
+    }}
+
+    /* ---- Tabs ------------------------------------------------------------- */
+    [data-baseweb="tab-list"] {{
+        gap: 2px;
+        background: {_P["bg_card"]} !important;
+        padding: 4px;
+        border-radius: 2px;
+        border: 1px solid {_P["border"]};
+    }}
+    [data-baseweb="tab"] {{
+        background: transparent !important;
+        border-radius: 1px !important;
+        font-size: 11px !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.08em;
+        padding: 6px 16px !important;
+        color: {_P["text_muted"]} !important;
+        border: none !important;
     }}
     [aria-selected="true"][data-baseweb="tab"] {{
-        background: {BLOOMBERG_PALETTE["accent"]} !important;
-        color: {BLOOMBERG_PALETTE["bg_primary"]} !important;
+        background: {_P["accent"]} !important;
+        color: {_P["bg_primary"]} !important;
+    }}
+    [data-baseweb="tab"]:hover {{
+        background: {_P["bg_hover"]} !important;
+        color: {_P["text_primary"]} !important;
+    }}
+
+    /* ---- DataFrames: look tabla terminal ---------------------------------- */
+    [data-testid="stDataFrame"] {{
+        border: 1px solid {_P["border"]} !important;
+        border-radius: 2px;
+    }}
+    [data-testid="stDataFrame"] table {{
+        font-size: 11px !important;
+        letter-spacing: 0.03em;
+    }}
+    [data-testid="stDataFrame"] th {{
+        background: {_P["bg_card"]} !important;
+        color: {_P["text_muted"]} !important;
+        text-transform: uppercase;
+        font-size: 9px !important;
+        letter-spacing: 0.08em;
+        font-weight: 600;
+        border-bottom: 1px solid {_P["border"]} !important;
+    }}
+    [data-testid="stDataFrame"] td {{
+        font-size: 11px !important;
+        border-bottom: 1px solid {_P["grid"]} !important;
+    }}
+
+    /* ---- Selectbox / multiselect ----------------------------------------- */
+    [data-baseweb="select"] {{
+        background: {_P["bg_card"]} !important;
+        border: 1px solid {_P["border"]} !important;
+        border-radius: 2px !important;
+        font-size: 11px !important;
+    }}
+    [data-baseweb="select"] * {{ font-size: 11px !important; }}
+
+    /* ---- Expander --------------------------------------------------------- */
+    [data-testid="stExpander"] {{
+        border: 1px solid {_P["border"]} !important;
+        border-radius: 2px !important;
+        background: {_P["bg_card"]} !important;
+    }}
+    [data-testid="stExpander"] summary {{
+        font-size: 10px !important;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: {_P["text_muted"]} !important;
+    }}
+
+    /* ---- Buttons ---------------------------------------------------------- */
+    .stButton button {{
+        background: transparent !important;
+        border: 1px solid {_P["accent"]} !important;
+        color: {_P["accent"]} !important;
+        font-size: 11px !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.10em;
+        text-transform: uppercase;
+        border-radius: 2px !important;
+        padding: 6px 16px !important;
+    }}
+    .stButton button:hover {{
+        background: {_P["accent"]} !important;
+        color: {_P["bg_primary"]} !important;
+    }}
+
+    /* ---- Sidebar widgets -------------------------------------------------- */
+    [data-testid="stSidebar"] label, [data-testid="stSidebar"] .stSelectbox label {{
+        font-size: 10px !important;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: {_P["text_muted"]} !important;
+    }}
+
+    /* ---- Info / warning / error boxes ------------------------------------ */
+    [data-testid="stAlert"] {{
+        border-radius: 2px !important;
+        border-left: 3px solid {_P["accent"]} !important;
+        font-size: 11px !important;
+    }}
+
+    /* ---- st.info ---------------------------------------------------------- */
+    [data-testid="stAlert"][data-baseweb="notification"] {{
+        background: {_P["bg_card"]} !important;
+    }}
+
+    /* ---- Plotly chart containers ----------------------------------------- */
+    .stPlotlyChart {{
+        border: 1px solid {_P["border"]};
+        border-radius: 2px;
     }}
     </style>
     """,

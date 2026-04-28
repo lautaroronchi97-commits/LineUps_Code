@@ -1,22 +1,18 @@
-# Tema dark Bloomberg para el dashboard.
-# Colores alineados con BLOOMBERG_PALETTE en config.py.
+# Tema terminal oscuro estilo Fintelligentia para el dashboard de granos.
+# Paleta alineada con BLOOMBERG_PALETTE en config.py.
 
 [theme]
 base = "dark"
-primaryColor = "#FF9900"             # amber Bloomberg (CTA, sliders)
-backgroundColor = "#0A0E1A"          # fondo principal (navy-black)
-secondaryBackgroundColor = "#141B2B" # sidebar, cards, widgets
-textColor = "#E1E5EE"                # gris claro sobre navy
+primaryColor     = "#e06010"   # naranja terminal (acento, sliders, botones)
+backgroundColor  = "#08080f"   # fondo principal (casi negro, tinte azul)
+secondaryBackgroundColor = "#0e0e1a"   # sidebar, cards, widgets
+textColor        = "#c8c8d4"   # texto principal
 
-# Fuente monoespaciada para que la grilla de numeros se parezca a una
-# terminal Bloomberg. "monospace" le pide a Streamlit que use la fuente
-# monoespaciada del sistema (Consolas/Menlo/Courier segun OS).
+# Fuente monoespaciada — look terminal de trading.
 font = "monospace"
 
 [server]
-# Util para correr streamlit en background sin que pida confirmacion de email.
 headless = true
 
 [browser]
-# No recolectar stats de uso.
 gatherUsageStats = false
