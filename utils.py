@@ -162,40 +162,47 @@ def setup_logging(nombre: str = "lineup", nivel: int = logging.INFO) -> logging.
     """
     Configura un logger que escribe a consola y a logs/scraper.log.
 
+    El RotatingFileHandler se registra UNA sola vez en el root logger para
+    que todos los loggers nombrados propaguen al mismo handler de archivo.
+    En Windows, multiples RotatingFileHandlers apuntando al mismo archivo
+    causan PermissionError al intentar rotar (el OS bloquea el rename).
+
     Uso:
         logger = setup_logging(__name__)
         logger.info("Arrancando backfill...")
     """
-    logger = logging.getLogger(nombre)
-    logger.setLevel(nivel)
-
-    # Evitamos duplicar handlers si la funcion se llama varias veces.
-    if logger.handlers:
-        return logger
+    from logging.handlers import RotatingFileHandler
 
     formato = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Handler a consola (stdout).
-    consola = logging.StreamHandler()
-    consola.setFormatter(formato)
-    logger.addHandler(consola)
+    # ---- Root logger: consola + archivo (solo configurar una vez) ----
+    root = logging.getLogger()
+    if not root.handlers:
+        root.setLevel(logging.DEBUG)  # el nivel efectivo lo controla cada logger
 
-    # Handler a archivo con rotacion. Sin rotacion, un backfill largo genera
-    # archivos de decenas de MB que llenan el disco.
-    # 5 MB x 3 archivos = maximo 15 MB de logs en disco.
-    from logging.handlers import RotatingFileHandler
-    logs_dir = Path(__file__).parent / "logs"
-    logs_dir.mkdir(exist_ok=True)
-    archivo = RotatingFileHandler(
-        logs_dir / "scraper.log",
-        maxBytes=5 * 1024 * 1024,  # 5 MB por archivo
-        backupCount=3,              # scraper.log, scraper.log.1, .2, .3
-        encoding="utf-8",
-    )
-    archivo.setFormatter(formato)
-    logger.addHandler(archivo)
+        consola = logging.StreamHandler()
+        consola.setFormatter(formato)
+        root.addHandler(consola)
 
+        # Un solo RotatingFileHandler compartido por todos los modulos.
+        # 5 MB x 3 archivos = maximo 15 MB en disco.
+        logs_dir = Path(__file__).parent / "logs"
+        logs_dir.mkdir(exist_ok=True)
+        archivo = RotatingFileHandler(
+            logs_dir / "scraper.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        archivo.setFormatter(formato)
+        root.addHandler(archivo)
+
+    # ---- Logger nombrado: solo establece el nivel, propaga al root ----
+    logger = logging.getLogger(nombre)
+    logger.setLevel(nivel)
+    # propagate=True es el default: los mensajes suben al root y llegan
+    # al handler de archivo sin que este logger necesite su propio handler.
     return logger
