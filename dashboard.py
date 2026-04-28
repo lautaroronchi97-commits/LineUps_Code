@@ -738,6 +738,113 @@ def pct_change(actual: float, prev: float) -> str:
 
 
 # ===========================================================================
+# Panel de alertas accionables: "Señales del día"
+# ===========================================================================
+
+def _render_senales_hoy():
+    """
+    Panel visible con alertas accionables basadas en datos ya cargados.
+    No hace queries directas a la DB: usa las funciones cached_* existentes.
+    """
+    alertas_info    = []
+    alertas_success = []
+    alertas_warning = []
+
+    # ---- Alerta: datos desactualizados (>36 horas) ----
+    _ts = cached_ultima_actualizacion()
+    if _ts is None:
+        alertas_warning.append("⚠️ No se pudo obtener el timestamp de la ultima actualizacion.")
+    else:
+        _ahora_utc = datetime.now(timezone.utc)
+        _ts_aware = _ts if _ts.tzinfo is not None else _ts.replace(tzinfo=timezone.utc)
+        _horas_atras = (_ahora_utc - _ts_aware).total_seconds() / 3600
+        if _horas_atras > 36:
+            _art_ts = _ts_aware.astimezone(timezone(timedelta(hours=-3)))
+            alertas_warning.append(
+                f"⚠️ **DATOS DESACTUALIZADOS** — ultima carga: "
+                f"{_art_ts.strftime('%d-%b-%Y %H:%M ART')} "
+                f"({_horas_atras:.0f}h atras). Verificar cron diario."
+            )
+
+    # ---- Datos de hoy y ayer para las alertas de buques ----
+    _desde_pan = fecha_ref - timedelta(days=2)
+    _df_pan = cached_exports_rango(_desde_pan, fecha_ref)
+
+    if not _df_pan.empty:
+        _df_pan["fecha_consulta"] = pd.to_datetime(_df_pan["fecha_consulta"])
+        _df_sen_hoy  = _df_pan[_df_pan["fecha_consulta"].dt.date == fecha_ref]
+        _df_sen_ayer = _df_pan[_df_pan["fecha_consulta"].dt.date == fecha_ref - timedelta(days=1)]
+
+        # ---- Alerta: buques nuevos grandes (>=50 000 t) no vistos ayer ----
+        if not _df_sen_hoy.empty:
+            _grandes_hoy = _df_sen_hoy[_df_sen_hoy["quantity"].fillna(0) >= 50_000]
+            _vessels_ayer = set(_df_sen_ayer["vessel"].dropna().unique()) if not _df_sen_ayer.empty else set()
+            _nuevos_grandes = _grandes_hoy[~_grandes_hoy["vessel"].isin(_vessels_ayer)]
+
+            # Dedupe por vessel (puede haber splits de destino).
+            _nuevos_grandes = (
+                _nuevos_grandes
+                .sort_values("quantity", ascending=False)
+                .drop_duplicates("vessel")
+            )
+            for _, _row in _nuevos_grandes.iterrows():
+                _qty_fmt = fmt_tons(_row.get("quantity"))
+                _shp = _row.get("shipper_canon") or _row.get("shipper") or "—"
+                alertas_success.append(
+                    f"🚢 **Buque nuevo grande** · {_row['vessel']} · "
+                    f"{_row.get('cargo','?')} · {_qty_fmt} · "
+                    f"Shipper: {_shp} · Puerto: {_row.get('port','?')}"
+                )
+
+    # ---- Alerta: z-score de shippers (usando calc ya existente) ----
+    if not _df_pan.empty:
+        _desde_shp_z = fecha_ref - timedelta(days=730)
+        _df_z_all = cached_exports_rango(_desde_shp_z, fecha_ref)
+        if not _df_z_all.empty:
+            _df_z_all["fecha_consulta"] = pd.to_datetime(_df_z_all["fecha_consulta"])
+            _df_zscores = _calcular_zscores_shippers(_df_z_all, fecha_ref, ventana_dias)
+            if not _df_zscores.empty:
+                for _, _zrow in _df_zscores.iterrows():
+                    _z = float(_zrow.get("Z-score", 0))
+                    _shp_n = _zrow["Shipper"]
+                    if _z >= 2:
+                        alertas_success.append(
+                            f"🔥 **Surge shipper** · {_shp_n} · "
+                            f"Z-score {_z:+.1f} (muy por encima de su media historica)"
+                        )
+                    elif _z <= -2:
+                        alertas_info.append(
+                            f"🔴 **Caida shipper** · {_shp_n} · "
+                            f"Z-score {_z:+.1f} (muy por debajo de su media historica)"
+                        )
+
+    # ---- Renderizar ----
+    total_alertas = len(alertas_warning) + len(alertas_success) + len(alertas_info)
+
+    st.markdown(
+        f"<h2 style='margin-bottom:4px;'>🔔 SEÑALES HOY"
+        f"{'  · ' + str(total_alertas) + ' alerta(s)' if total_alertas else ''}"
+        f"</h2>",
+        unsafe_allow_html=True,
+    )
+
+    if total_alertas == 0:
+        st.success("✅ Sin señales destacadas hoy.")
+    else:
+        for msg in alertas_warning:
+            st.warning(msg)
+        for msg in alertas_success:
+            st.success(msg)
+        for msg in alertas_info:
+            st.info(msg)
+
+    st.divider()
+
+
+_render_senales_hoy()
+
+
+# ===========================================================================
 # Pestanas
 # ===========================================================================
 
@@ -864,7 +971,88 @@ def _render_panorama_tab():
         # Promedio movil 7d como overlay.
         daily_tons["ma7"] = daily_tons["tons"].rolling(7, min_periods=1).mean()
 
+        # --- Comparativa interanual: año anterior + banda ±1σ histórica ------
+        # Traemos hasta 5 años hacia atrás para calcular la banda estadística.
+        _desde_hist = fecha_ref.replace(year=fecha_ref.year - 5)
+        _df_hist = cached_exports_rango(_desde_hist, fecha_ref - timedelta(days=1))
+
+        _df_ant = pd.DataFrame()
+        _band_stats = pd.DataFrame()
+
+        if not _df_hist.empty:
+            _df_hist = _df_hist.copy()
+            _df_hist["fecha_consulta"] = pd.to_datetime(_df_hist["fecha_consulta"])
+            _df_hist["_year"] = _df_hist["fecha_consulta"].dt.year
+            _df_hist["_doy"] = _df_hist["fecha_consulta"].dt.dayofyear
+
+            # Agregar tons diarias por año-doy para alinear en eje X.
+            _hist_daily = (
+                _df_hist.groupby(["_year", "_doy"])["quantity"]
+                .sum()
+                .reset_index()
+                .rename(columns={"quantity": "tons"})
+            )
+
+            # --- Año anterior ---
+            _anio_ant = fecha_ref.year - 1
+            _df_ant_raw = _hist_daily[_hist_daily["_year"] == _anio_ant].copy()
+            if not _df_ant_raw.empty:
+                _df_ant_raw["fecha_plot"] = _df_ant_raw["_doy"].apply(
+                    lambda doy: (
+                        date(fecha_ref.year, 1, 1) + timedelta(days=int(doy) - 1)
+                    )
+                )
+                _df_ant = _df_ant_raw
+
+            # --- Banda ±1σ (años < año anterior para no contaminar con año ant) ---
+            _df_band_raw = _hist_daily[_hist_daily["_year"] < _anio_ant].copy()
+            if not _df_band_raw.empty:
+                _band_stats = (
+                    _df_band_raw.groupby("_doy")["tons"]
+                    .agg(media="mean", sigma="std")
+                    .reset_index()
+                )
+                _band_stats["fecha_plot"] = _band_stats["_doy"].apply(
+                    lambda doy: (
+                        date(fecha_ref.year, 1, 1) + timedelta(days=int(doy) - 1)
+                    )
+                )
+        # ---------------------------------------------------------------------
+
         fig_t = go.Figure()
+
+        # Banda ±1σ histórica (renderizar primero para que quede debajo).
+        if not _band_stats.empty:
+            _sigma_fill = pd.concat([
+                _band_stats["fecha_plot"],
+                _band_stats["fecha_plot"].iloc[::-1],
+            ])
+            _sigma_y = pd.concat([
+                _band_stats["media"] + _band_stats["sigma"].fillna(0),
+                (_band_stats["media"] - _band_stats["sigma"].fillna(0)).iloc[::-1],
+            ])
+            fig_t.add_trace(go.Scatter(
+                x=_sigma_fill,
+                y=_sigma_y,
+                fill="toself",
+                fillcolor="rgba(102,85,238,0.10)",
+                line=dict(color="rgba(255,255,255,0)"),
+                name="Banda hist ±1σ",
+                showlegend=True,
+                hoverinfo="skip",
+            ))
+
+        # Línea año anterior (punteada, más tenue).
+        if not _df_ant.empty:
+            fig_t.add_trace(go.Scatter(
+                x=_df_ant["fecha_plot"],
+                y=_df_ant["tons"],
+                mode="lines",
+                name=f"Año {_anio_ant}",
+                line=dict(color="#6655ee", dash="dot", width=1),
+                opacity=0.7,
+            ))
+
         fig_t.add_bar(
             x=daily_tons["fecha"], y=daily_tons["tons"],
             name="Toneladas",
@@ -956,6 +1144,14 @@ def _render_panorama_tab():
         .reset_index(drop=True)
     )
     st.dataframe(df_resumen, use_container_width=True, hide_index=True, height=320)
+    _csv_panorama = df_resumen.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇ Descargar CSV",
+        data=_csv_panorama,
+        file_name=f"panorama_{fecha_ref}.csv",
+        mime="text/csv",
+        key="dl_panorama",
+    )
 
     st.divider()
 
@@ -1049,6 +1245,14 @@ def _render_shippers_tab():
             "Shipper", "Senal", "Buques (vent)", "Media hist.", "σ", "Z-score", "Tons",
         ],
         height=420,
+    )
+    _csv_shippers = df_senales.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇ Descargar CSV",
+        data=_csv_shippers,
+        file_name=f"shippers_{fecha_ref}.csv",
+        mime="text/csv",
+        key="dl_shippers",
     )
 
     st.caption(
@@ -1536,6 +1740,14 @@ def _render_productos_tab(fecha_ref):
             df_cmp.drop(columns=["Tons_raw"]),
             use_container_width=True, hide_index=True,
         )
+        _csv_productos = df_cmp.drop(columns=["Tons_raw"]).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="⬇ Descargar CSV",
+            data=_csv_productos,
+            file_name=f"productos_{fecha_ref}.csv",
+            mime="text/csv",
+            key="dl_productos",
+        )
 
         # ------------------- DJVE: ventas declaradas (MAGyP) -------------------
         st.divider()
@@ -1919,6 +2131,14 @@ def _render_congestion_tab(fecha_ref):
 
         df_filtrado = df_det[mask]
         st.dataframe(df_filtrado, use_container_width=True, hide_index=True, height=480)
+        _csv_congestion = df_filtrado.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="⬇ Descargar CSV",
+            data=_csv_congestion,
+            file_name=f"congestion_{fecha_ref}.csv",
+            mime="text/csv",
+            key="dl_congestion",
+        )
         st.caption(f"**{mask.sum()}** de {len(df_det)} buques · filtros activos: "
                    f"{sum(bool(f) for f in [f_prod,f_ship,f_zona,f_dest])}/4")
 
