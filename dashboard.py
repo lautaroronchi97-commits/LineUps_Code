@@ -36,13 +36,28 @@ from datetime import date, datetime, timedelta, timezone
 # .strip() porque hemos visto whitespace invisible en el service_role al pegar.
 import streamlit as st
 
-for _nombre_secret in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY"):
+# Solo cargamos URL y ANON_KEY desde st.secrets.
+# La SERVICE_ROLE_KEY NO debe estar en secrets del dashboard (usa solo anon_key).
+# Si alguien la agrego por error, fallamos rapido con un mensaje claro.
+for _nombre_secret in ("SUPABASE_URL", "SUPABASE_ANON_KEY"):
     try:
         _valor = st.secrets[_nombre_secret]
         if isinstance(_valor, str):
             os.environ[_nombre_secret] = _valor.strip()
     except (KeyError, FileNotFoundError):
         pass
+
+try:
+    if st.secrets.get("SUPABASE_SERVICE_ROLE_KEY"):
+        st.error(
+            "⚠️ **Configuracion incorrecta:** `SUPABASE_SERVICE_ROLE_KEY` no debe "
+            "estar en los secrets del dashboard. "
+            "Usa `SUPABASE_ANON_KEY` (clave de solo-lectura). "
+            "Ver `.streamlit/secrets.toml.example`."
+        )
+        st.stop()
+except FileNotFoundError:
+    pass  # No hay secrets.toml en local; ok, se usa .env
 
 import numpy as np
 import pandas as pd

@@ -136,6 +136,9 @@ def upsert_lineup(filas: list[dict[str, Any]], batch_size: int = UPSERT_BATCH_SI
 # Lectura (con paginacion)
 # ---------------------------------------------------------------------------
 
+_FETCH_MAX_ROWS = 2_000_000  # techo de seguridad: aborta si la tabla crece inesperadamente
+
+
 def _fetch_all(query_builder) -> list[dict[str, Any]]:
     """
     Consume una query de supabase-py paginando hasta traer todas las filas.
@@ -146,6 +149,9 @@ def _fetch_all(query_builder) -> list[dict[str, Any]]:
 
     El `query_builder` debe ser el builder ANTES de llamar .execute(). Ojo:
     la instancia se reusa, entonces no hay que haberle llamado .range() antes.
+
+    Corta en _FETCH_MAX_ROWS como circuit breaker ante crecimiento inesperado
+    de la tabla (bug de dedup, ingesta accidental de duplicados masivos).
     """
     filas: list[dict[str, Any]] = []
     inicio = 0
@@ -157,6 +163,13 @@ def _fetch_all(query_builder) -> list[dict[str, Any]]:
         if len(batch) < FETCH_PAGE_SIZE:
             break
         inicio += FETCH_PAGE_SIZE
+        if len(filas) >= _FETCH_MAX_ROWS:
+            logger.error(
+                "_fetch_all: superado el limite de %d filas. Abortando paginacion. "
+                "Verificar si hay duplicados masivos en la DB.",
+                _FETCH_MAX_ROWS,
+            )
+            break
     return filas
 
 

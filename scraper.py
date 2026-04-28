@@ -74,6 +74,14 @@ def fetch_lineup_html(fecha: date) -> str:
                 timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
+            # Validar Content-Type: si ISA devuelve una pagina de bloqueo o login
+            # wall con 200-OK, lo detectamos antes de intentar parsear la tabla.
+            ct = resp.headers.get("Content-Type", "")
+            if "text/html" not in ct:
+                logger.warning(
+                    "Content-Type inesperado de ISA para %s: '%s'. Intentando parsear igual.",
+                    fecha, ct,
+                )
             # La pagina viene en iso-8859-1 segun el meta. requests a veces
             # adivina mal la codificacion; se la fijamos explicita.
             resp.encoding = "iso-8859-1"

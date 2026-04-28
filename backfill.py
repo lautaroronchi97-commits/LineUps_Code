@@ -126,13 +126,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--delay", type=float, default=DEFAULT_DELAY_SECONDS,
-        help=f"Segundos entre requests. Default: {DEFAULT_DELAY_SECONDS}",
+        help=f"Segundos entre requests. Minimo: 0.5. Default: {DEFAULT_DELAY_SECONDS}",
     )
     parser.add_argument(
         "--no-skip", action="store_true",
         help="Re-scrapea fechas que ya tienen data en la DB.",
     )
     args = parser.parse_args()
+
+    # Validar delay minimo para no banear la IP del runner.
+    if args.delay < 0.5:
+        parser.error(f"--delay minimo es 0.5s para no saturar el servidor (recibido: {args.delay})")
 
     backfill(
         desde=args.from_date,

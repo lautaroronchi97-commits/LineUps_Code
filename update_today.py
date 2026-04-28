@@ -29,11 +29,18 @@ logger = setup_logging(__name__)
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dias", type=int, default=3,
-                        help="Cuantos dias hacia atras re-scrapear (ademas de hoy). Default: 3.")
+                        help="Cuantos dias hacia atras re-scrapear (ademas de hoy). Default: 3. Max: 30.")
     parser.add_argument("--solo-hoy", action="store_true",
                         help="Solo scrapea hoy (ignora --dias).")
-    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY_SECONDS)
+    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY_SECONDS,
+                        help=f"Segundos entre requests. Minimo: 0.5. Default: {DEFAULT_DELAY_SECONDS}")
     args = parser.parse_args()
+
+    # Validar bounds para evitar baneos de IP o saturacion de cuotas.
+    if not 0 <= args.dias <= 30:
+        parser.error(f"--dias debe estar entre 0 y 30 (recibido: {args.dias})")
+    if args.delay < 0.5:
+        parser.error(f"--delay minimo es 0.5s para no saturar el servidor (recibido: {args.delay})")
 
     hoy = date.today()
     if args.solo_hoy:

@@ -4,9 +4,9 @@
 # changelog de la lib y los CVEs en https://nvd.nist.gov.
 requests>=2.32,<3
 beautifulsoup4>=4.12,<5
-# lxml<6 evita la 6.x hasta validar que el parser de scraper.py siga
-# comportandose igual (aparte de protegernos de XXE en versiones viejas).
-lxml>=5.3,<6
+# lxml: validado con 6.1.0 — el parser HTML de scraper.py sigue comportandose
+# correctamente. Cap en <6.2 para controlar upgrades automaticos.
+lxml>=5.3,<6.2
 
 # Datos
 pandas>=2.2,<3

@@ -186,6 +186,15 @@ def _bajar_xlsx_con_retry(url: str, timeout: int, descripcion: str) -> bytes | N
         try:
             resp = requests.get(url, headers=_HEADERS, timeout=timeout)
             resp.raise_for_status()
+            # Validar Content-Type: si MAGyP devuelve HTML de error con codigo 200
+            # (pasa con algunos proxies), rechazamos antes de intentar parsear.
+            ct = resp.headers.get("Content-Type", "")
+            tipos_validos = ("spreadsheetml", "octet-stream", "excel", "binary")
+            if not any(t in ct for t in tipos_validos):
+                _logger.warning(
+                    "Content-Type inesperado de %s: '%s'. Intentando parsear igual.",
+                    descripcion, ct,
+                )
             return resp.content
         except requests.exceptions.RequestException as exc:
             ultimo_error = exc

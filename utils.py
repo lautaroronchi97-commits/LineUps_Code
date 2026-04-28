@@ -183,10 +183,18 @@ def setup_logging(nombre: str = "lineup", nivel: int = logging.INFO) -> logging.
     consola.setFormatter(formato)
     logger.addHandler(consola)
 
-    # Handler a archivo. Creamos la carpeta logs/ si no existe.
+    # Handler a archivo con rotacion. Sin rotacion, un backfill largo genera
+    # archivos de decenas de MB que llenan el disco.
+    # 5 MB x 3 archivos = maximo 15 MB de logs en disco.
+    from logging.handlers import RotatingFileHandler
     logs_dir = Path(__file__).parent / "logs"
     logs_dir.mkdir(exist_ok=True)
-    archivo = logging.FileHandler(logs_dir / "scraper.log", encoding="utf-8")
+    archivo = RotatingFileHandler(
+        logs_dir / "scraper.log",
+        maxBytes=5 * 1024 * 1024,  # 5 MB por archivo
+        backupCount=3,              # scraper.log, scraper.log.1, .2, .3
+        encoding="utf-8",
+    )
     archivo.setFormatter(formato)
     logger.addHandler(archivo)
 
