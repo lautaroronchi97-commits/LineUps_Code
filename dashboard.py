@@ -1037,7 +1037,14 @@ with tab_shp:
 # PESTANA 3: PRODUCTOS (vista por producto con comparacion de campanas)
 # ==========================================================================
 
-with tab_prd:
+@st.fragment
+def _render_productos_tab(fecha_ref):
+    """
+    Render de la pestaña Productos. Como `@st.fragment`, cuando el usuario
+    cambia el selector de producto SOLO se re-ejecuta esta funcion — el resto
+    del dashboard (Panorama, Shippers, Congestion) NO se vuelve a calcular.
+    Sin esto, cambiar producto re-disparaba todo el script y la UI se tildaba.
+    """
     col_sel, col_info = st.columns([1, 3])
     with col_sel:
         opciones = [(codigo, display) for codigo, display, _ in PRODUCTOS_PRIORITARIOS]
@@ -1344,16 +1351,9 @@ with tab_prd:
             else:
                 djve_mensual = pd.Series(0, index=periodos, dtype=float)
 
-            # Line-up mensual: hay que deduplicar antes de sumar. Un mismo
-            # buque aparece en cada snapshot diario hasta que zarpa, asi que
-            # sumar todos los `fecha_consulta` infla las toneladas ~10x. La
-            # solucion: para cada buque tomar SOLO la ultima foto (el resto
-            # son repeticiones del mismo cargo) y asignar el embarque al mes
-            # de su ETB (fallback ETA o fecha_consulta).
+            # df_prd ya viene deduplicado arriba (una fila por buque, en su
+            # ultima foto). Solo agregamos la columna mensual de carga.
             lu_prd = df_prd.copy()
-            lu_prd = lu_prd.sort_values("fecha_consulta")
-            ultima_foto = lu_prd.groupby("vessel")["fecha_consulta"].transform("max")
-            lu_prd = lu_prd[lu_prd["fecha_consulta"] == ultima_foto]
             lu_prd["mes_carga"] = pd.to_datetime(
                 lu_prd["etb"].fillna(lu_prd["eta"]).fillna(lu_prd["fecha_consulta"])
             ).dt.to_period("M")
@@ -1538,6 +1538,10 @@ with tab_prd:
                     f"Frecuencia: {meta['frecuencia']}  \n"
                     f"Cubre: {meta['cubre']}"
                 )
+
+
+with tab_prd:
+    _render_productos_tab(fecha_ref)
 
 
 # ==========================================================================
