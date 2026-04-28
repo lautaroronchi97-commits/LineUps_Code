@@ -47,10 +47,18 @@ _client_cache: Client | None = None
 
 def get_client() -> Client:
     """
-    Devuelve un cliente Supabase autenticado con las credenciales de .env.
+    Devuelve un cliente Supabase autenticado con las credenciales del entorno.
 
-    Busca SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY. Si falta alguna, levanta
-    RuntimeError con un mensaje claro explicando como resolverlo.
+    Estrategia de key (primera que este definida gana):
+      1. SUPABASE_ANON_KEY  → clave publica de solo-lectura; segura para el
+                             dashboard en Streamlit Cloud (RLS bloquea escrituras).
+      2. SUPABASE_SERVICE_ROLE_KEY → clave con permisos totales; usada por los
+                             scripts de cron (backfill, update_today, update_djve)
+                             y por el desarrollo local.
+
+    Esto permite que Streamlit Cloud tenga SOLO la anon_key (read-only) y que
+    GitHub Actions tenga SOLO la service_role_key (lectura + escritura), sin
+    cambios en los scripts de cron.
     """
     global _client_cache
     if _client_cache is not None:
@@ -65,13 +73,14 @@ def get_client() -> Client:
         logger.info("No se encontro .env local; uso variables de entorno del sistema.")
 
     url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    # Preferir anon_key (solo-lectura, dashboard) sobre service_role (admin, cron).
+    key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
     if not url or not key:
         raise RuntimeError(
             "Faltan credenciales de Supabase.\n"
-            f"  Esperaba SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en {env_path} "
-            "o en variables de entorno.\n"
+            f"  Esperaba SUPABASE_URL y (SUPABASE_ANON_KEY o SUPABASE_SERVICE_ROLE_KEY) "
+            f"en {env_path} o en variables de entorno.\n"
             "  Copia .env.example a .env y completalo con los valores de "
             "tu proyecto Supabase (Settings > API)."
         )

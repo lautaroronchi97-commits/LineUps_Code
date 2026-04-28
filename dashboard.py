@@ -36,7 +36,7 @@ from datetime import date, datetime, timedelta, timezone
 # .strip() porque hemos visto whitespace invisible en el service_role al pegar.
 import streamlit as st
 
-for _nombre_secret in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"):
+for _nombre_secret in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY"):
     try:
         _valor = st.secrets[_nombre_secret]
         if isinstance(_valor, str):
@@ -383,7 +383,7 @@ if not estado["conectado"]:
     st.error(f"No puedo conectarme a Supabase: {estado['error']}")
     st.info(
         "Verifica que `.env` (o los secrets de Streamlit Cloud) "
-        "tengan SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY validos."
+        "tengan SUPABASE_URL y SUPABASE_ANON_KEY (o SUPABASE_SERVICE_ROLE_KEY) validos."
     )
     st.stop()
 
