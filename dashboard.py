@@ -252,6 +252,39 @@ def cached_clima_zonas() -> dict[str, pd.DataFrame]:
     return clima_mod.pronostico_todas_zonas()
 
 
+@st.cache_data(ttl=300)
+def cached_serie_congestion(desde: date, hasta: date) -> pd.DataFrame:
+    """
+    Para cada dia en [desde, hasta]: cuantos buques tenian etb<=dia<=ets.
+    Una sola query del rango y agrupado en pandas (~30x menos round-trips).
+    """
+    df_full = query_lineup(fecha_desde=desde, fecha_hasta=hasta)
+    if df_full.empty:
+        return pd.DataFrame()
+
+    df_full = df_full[
+        (df_full["ops"] == "LOAD") &
+        df_full["etb"].notna() & df_full["ets"].notna()
+    ].copy()
+    if df_full.empty:
+        return pd.DataFrame()
+
+    df_full["fecha"] = pd.to_datetime(df_full["fecha_consulta"]).dt.date
+    df_full["etb_d"] = pd.to_datetime(df_full["etb"]).dt.date
+    df_full["ets_d"] = pd.to_datetime(df_full["ets"]).dt.date
+    mask = (df_full["etb_d"] <= df_full["fecha"]) & (df_full["ets_d"] >= df_full["fecha"])
+    df_ep = df_full[mask].copy()
+    if df_ep.empty:
+        return pd.DataFrame()
+
+    mapa_zona = {p: zona_de_puerto(p) for p in df_ep["port"].unique()}
+    df_ep["zona"] = df_ep["port"].map(mapa_zona)
+    return (
+        df_ep.groupby(["fecha", "zona"])["vessel"]
+        .nunique().reset_index(name="buques")
+    )
+
+
 @st.cache_data(ttl=600, show_spinner="Cargando DJVE...")
 def cached_djve(anio: int) -> pd.DataFrame:
     """
@@ -716,6 +749,14 @@ def _render_panorama_tab():
         tons_sem_act = df_sem_act[df_sem_act["cargo"] == codigo]["quantity"].fillna(0).sum()
         tons_sem_ant = df_sem_ant[df_sem_ant["cargo"] == codigo]["quantity"].fillna(0).sum()
 
+        # Top shipper y top destino del dia para este producto.
+        hoy_ship = hoy_p.groupby("shipper_canon")["quantity"].sum()
+        top_ship = hoy_ship.idxmax() if not hoy_ship.empty else "—"
+        hoy_dest = hoy_p.groupby(
+            hoy_p["dest_orig"].fillna("s/d").str.strip().str.upper()
+        )["quantity"].sum()
+        top_dest = hoy_dest.idxmax() if not hoy_dest.empty else "—"
+
         # Campana actual vs anterior.
         camp_actual = campanas.campana_de(codigo, fecha_ref)
         camp_anterior = campanas.campanas_anteriores(codigo, fecha_ref, n=1)[0]
@@ -730,6 +771,8 @@ def _render_panorama_tab():
             f"Prom {ventana_dias}d": fmt_tons(tons_p_prom),
             "vs prom":        pct_change(tons_p_hoy, tons_p_prom),
             "Δ sem":          pct_change(tons_sem_act, tons_sem_ant),
+            "Top shipper":    top_ship,
+            "Top destino":    top_dest,
             "Campana":        camp_actual,
             # Columna interna para ordenar por valor numerico real, ya que la
             # columna "Tons hoy" esta formateada como string ("46K").
@@ -913,20 +956,42 @@ def _render_shippers_tab():
         "mes anterior. Δ YoY = variacion vs mismo mes hace 12 meses."
     )
 
+    # Filtro por producto (en expander colapsado para no ocupar espacio).
+    with st.expander("Filtrar por producto / cosecha", expanded=False):
+        _prod_opts = ["Todos"] + sorted(df_shp_all["cargo"].dropna().unique().tolist())
+        _camp_opts_shp = ["Todas"] + sorted(
+            df_shp_all["cargo"].apply(
+                lambda c: campanas.campana_de(c, fecha_ref)
+            ).unique().tolist(),
+            reverse=True,
+        )
+        fmc1, fmc2 = st.columns(2)
+        f_prod_mes = fmc1.selectbox("Producto", _prod_opts, key="shp_mes_prod")
+        f_camp_mes = fmc2.selectbox("Cosecha", _camp_opts_shp, key="shp_mes_camp")
+
     hoy_per_shp = pd.Period(fecha_ref, freq="M")
     periodos_3 = [(hoy_per_shp - i) for i in range(2, -1, -1)]
     yoy_per = hoy_per_shp - 12
 
-    # Dedupe: tomar la ultima foto por buque (mismo motivo que en waterfall:
-    # un buque aparece en cada snapshot diario hasta que zarpa). Asignar al
-    # mes de carga via ETB (fallback ETA/fecha_consulta).
+    # Dedupe: tomar la ultima foto por buque. Asignar al mes de carga via ETB.
     df_shp_mes = df_shp_all.copy()
+    if f_prod_mes != "Todos":
+        df_shp_mes = df_shp_mes[df_shp_mes["cargo"] == f_prod_mes]
     df_shp_mes = df_shp_mes.sort_values("fecha_consulta")
     ult_foto_shp = df_shp_mes.groupby("vessel")["fecha_consulta"].transform("max")
     df_shp_mes = df_shp_mes[df_shp_mes["fecha_consulta"] == ult_foto_shp]
     df_shp_mes["mes_carga"] = pd.to_datetime(
         df_shp_mes["etb"].fillna(df_shp_mes["eta"]).fillna(df_shp_mes["fecha_consulta"])
     ).dt.to_period("M")
+    # Filtro cosecha: si el usuario elige una, filtrar por fecha de inicio de campaña.
+    if f_camp_mes != "Todas" and not df_shp_mes.empty:
+        # Calcular campaña por mes de carga usando el primer producto disponible
+        _prod_ref = f_prod_mes if f_prod_mes != "Todos" else "MAIZE"
+        df_shp_mes = df_shp_mes[
+            df_shp_mes["mes_carga"].apply(
+                lambda m: campanas.campana_de(_prod_ref, m.to_timestamp().date()) == f_camp_mes
+            )
+        ]
     pivot_mes = (
         df_shp_mes.groupby(["shipper_canon", "mes_carga"])["quantity"].sum()
         .unstack(fill_value=0)
@@ -952,6 +1017,7 @@ def _render_shippers_tab():
             label_anterior: fmt_tons(v_ant),
             label_prev:     fmt_tons(v_prev),
             label_actual:   fmt_tons(v_act),
+            "Total 3m":     fmt_tons(v_ant + v_prev + v_act),
             "Δ MoM": (f"{delta_mom:+.0f}%" if delta_mom is not None else "—"),
             "Δ YoY": (f"{delta_yoy:+.0f}%" if delta_yoy is not None else "—"),
             "_sort": v_act,
@@ -1611,7 +1677,12 @@ with tab_prd:
 # PESTANA 4: CONGESTION
 # ==========================================================================
 
-with tab_cng:
+@st.fragment
+def _render_congestion_tab(fecha_ref):
+    """
+    Render de la pestaña Congestión. Como @st.fragment, cambiar cualquier
+    filtro solo rerenderiza esta función sin tocar el resto del dashboard.
+    """
     st.subheader(f"Buques en puerto ahora · {fecha_ref}")
 
     df_en_puerto = cached_en_puerto_ahora(fecha_ref)
@@ -1635,84 +1706,60 @@ with tab_cng:
 
         st.divider()
 
-        # ------------------- Detalle por puerto -------------------
+        # ------------------- Tabla filtrable -------------------
         st.caption("Detalle por puerto")
+
+        # Preparar DataFrame completo con todas las columnas antes de filtrar.
         df_det = df_en_puerto.assign(
             dias_en_puerto=lambda x: (
                 pd.to_datetime(fecha_ref) - pd.to_datetime(x["etb"])
             ).dt.days,
-            # Demora = dias entre ETA esperado y ETB real (cuánto tardó en atracar).
-            # Positivo = llego tarde vs lo prometido; negativo = adelantado.
             demora_eta=lambda x: (
                 pd.to_datetime(x["etb"]) - pd.to_datetime(x["eta"])
             ).dt.days,
+            destino=lambda x: x["dest_orig"].fillna("s/d").str.strip().str.upper(),
         )[
             ["zona", "port", "vessel", "cargo", "quantity", "shipper_canon",
-             "eta", "etb", "ets", "dias_en_puerto", "demora_eta", "remarks"]
+             "destino", "eta", "etb", "ets", "dias_en_puerto", "demora_eta", "remarks"]
         ].rename(columns={
             "zona": "Zona", "port": "Puerto", "vessel": "Buque",
             "cargo": "Producto", "quantity": "Tons",
-            "shipper_canon": "Shipper", "eta": "ETA orig",
-            "etb": "ETB", "ets": "ETS",
+            "shipper_canon": "Shipper", "destino": "Destino",
+            "eta": "ETA orig", "etb": "ETB", "ets": "ETS",
             "dias_en_puerto": "Dias en puerto",
             "demora_eta": "Demora ETA (d)",
             "remarks": "Estado",
         })
         df_det = df_det.sort_values(["Zona", "Puerto"])
 
-        st.dataframe(df_det, use_container_width=True, hide_index=True, height=400)
+        # Filtros: Producto, Shipper, Zona, Destino en una fila.
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        f_prod  = fc1.multiselect(
+            "Producto", sorted(df_det["Producto"].dropna().unique()), key="cng_prod")
+        f_ship  = fc2.multiselect(
+            "Shipper",  sorted(df_det["Shipper"].dropna().unique()),  key="cng_ship")
+        f_zona  = fc3.multiselect(
+            "Zona",     sorted(df_det["Zona"].dropna().unique()),     key="cng_zona")
+        f_dest  = fc4.multiselect(
+            "Destino",  sorted(df_det["Destino"].dropna().unique()),  key="cng_dest")
+
+        mask = pd.Series(True, index=df_det.index)
+        if f_prod:  mask &= df_det["Producto"].isin(f_prod)
+        if f_ship:  mask &= df_det["Shipper"].isin(f_ship)
+        if f_zona:  mask &= df_det["Zona"].isin(f_zona)
+        if f_dest:  mask &= df_det["Destino"].isin(f_dest)
+
+        df_filtrado = df_det[mask]
+        st.dataframe(df_filtrado, use_container_width=True, hide_index=True, height=480)
+        st.caption(f"**{mask.sum()}** de {len(df_det)} buques · filtros activos: "
+                   f"{sum(bool(f) for f in [f_prod,f_ship,f_zona,f_dest])}/4")
 
         st.divider()
 
         # ------------------- Evolucion de congestion (ultimos 30d) -------------------
         st.caption("Evolucion de buques simultaneos en puerto · ultimos 30 dias")
-        # Serie: para cada dia en los ultimos 30, cuantos buques tenian
-        # etb <= dia <= ets en el snapshot de ese mismo dia-consulta.
-        fechas_serie = pd.date_range(
-            end=fecha_ref, periods=30, freq="D",
-        ).date
-
-        # PERF: la version anterior hacia 30 queries (una por dia). Ahora
-        # hacemos UNA sola query del rango y agrupamos en pandas (~30× menos
-        # round-trips a Supabase). Cache 5 min porque la pestana se mira poco.
-        @st.cache_data(ttl=300)
-        def _serie_congestion(desde: date, hasta: date) -> pd.DataFrame:
-            df_full = query_lineup(fecha_desde=desde, fecha_hasta=hasta)
-            if df_full.empty:
-                return pd.DataFrame()
-
-            df_full = df_full[
-                (df_full["ops"] == "LOAD") &
-                df_full["etb"].notna() & df_full["ets"].notna()
-            ].copy()
-            if df_full.empty:
-                return pd.DataFrame()
-
-            # Para cada fecha_consulta, los buques con etb <= fecha <= ets.
-            # Como fecha_consulta == el dia que queremos contar, podemos
-            # filtrar directo: el snapshot de cada dia ya tiene el etb/ets
-            # vigente para ese dia.
-            df_full["fecha"] = pd.to_datetime(df_full["fecha_consulta"]).dt.date
-            df_full["etb_d"] = pd.to_datetime(df_full["etb"]).dt.date
-            df_full["ets_d"] = pd.to_datetime(df_full["ets"]).dt.date
-
-            mask = (df_full["etb_d"] <= df_full["fecha"]) & (df_full["ets_d"] >= df_full["fecha"])
-            df_en_puerto = df_full[mask].copy()
-            if df_en_puerto.empty:
-                return pd.DataFrame()
-
-            # Vectorizamos zona_de_puerto via mapa unico (mas rapido que apply).
-            puertos_unicos = df_en_puerto["port"].unique()
-            mapa_zona = {p: zona_de_puerto(p) for p in puertos_unicos}
-            df_en_puerto["zona"] = df_en_puerto["port"].map(mapa_zona)
-
-            return (
-                df_en_puerto.groupby(["fecha", "zona"])["vessel"]
-                .nunique()
-                .reset_index(name="buques")
-            )
-
-        df_cong = _serie_congestion(fechas_serie[0], fechas_serie[-1])
+        fechas_serie = pd.date_range(end=fecha_ref, periods=30, freq="D").date
+        df_cong = cached_serie_congestion(fechas_serie[0], fechas_serie[-1])
 
         if df_cong.empty:
             st.info("Sin data de congestion en los ultimos 30 dias.")
@@ -1799,6 +1846,10 @@ with tab_cng:
                         """,
                         unsafe_allow_html=True,
                     )
+
+
+with tab_cng:
+    _render_congestion_tab(fecha_ref)
 
 
 # ---------------------------------------------------------------------------
