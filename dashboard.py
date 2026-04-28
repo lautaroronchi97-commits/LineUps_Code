@@ -597,7 +597,21 @@ def _render_panorama_tab():
         buques_arribando_hoy,
         delta=f"{buques_arribando_hoy - buques_arribando_7d:+d} vs 7d" if buques_arribando_7d else None,
     )
-    k3.metric("Total buques hoy", buques_cargando_hoy + buques_arribando_hoy)
+    # Backlog: buques con ETA futura (próximos 7d) = toneladas en la cola.
+    # Más accionable que el conteo total de buques del dia.
+    df_backlog = df_panorama[
+        (df_panorama["fecha_consulta"].dt.date == fecha_ref) &
+        (df_panorama["eta"] > fecha_ref) &
+        (df_panorama["eta"] <= fecha_ref + timedelta(days=7))
+    ]
+    tons_backlog_7d = df_backlog["quantity"].fillna(0).sum()
+    k3.metric(
+        "En cola (próx 7d)",
+        fmt_tons(tons_backlog_7d),
+        delta=f"{df_backlog['vessel'].nunique()} buques",
+        delta_color="off",
+        help="Toneladas de buques con ETA en los próximos 7 días — mide la presión de carga inminente.",
+    )
     k4.metric("Toneladas hoy", fmt_tons(tons_hoy), delta=pct_change(tons_hoy, tons_7d))
     k5.metric(f"Promedio {ventana_dias}d", fmt_tons(tons_promedio_ventana))
 
@@ -675,6 +689,16 @@ def _render_panorama_tab():
     # ------------------- Tabla resumen por producto -------------------
     st.subheader("Resumen por producto · hoy vs tendencia")
 
+    # Semana actual y semana anterior para calcular Δ semanal.
+    semana_actual_desde = fecha_ref - timedelta(days=6)
+    semana_ant_desde    = fecha_ref - timedelta(days=13)
+    semana_ant_hasta    = fecha_ref - timedelta(days=7)
+    df_sem_act = df_panorama[df_panorama["fecha_consulta"].dt.date >= semana_actual_desde]
+    df_sem_ant = df_panorama[
+        (df_panorama["fecha_consulta"].dt.date >= semana_ant_desde) &
+        (df_panorama["fecha_consulta"].dt.date <= semana_ant_hasta)
+    ]
+
     resumen_rows = []
     for codigo, display, _familia in PRODUCTOS_PRIORITARIOS:
         hoy_p = df_hoy[df_hoy["cargo"] == codigo]
@@ -687,6 +711,10 @@ def _render_panorama_tab():
             vent_p.groupby(vent_p["fecha_consulta"].dt.date)["quantity"]
             .sum().mean() if not vent_p.empty else 0
         )
+
+        # Δ semanal: semana actual (7d) vs semana anterior (7d).
+        tons_sem_act = df_sem_act[df_sem_act["cargo"] == codigo]["quantity"].fillna(0).sum()
+        tons_sem_ant = df_sem_ant[df_sem_ant["cargo"] == codigo]["quantity"].fillna(0).sum()
 
         # Campana actual vs anterior.
         camp_actual = campanas.campana_de(codigo, fecha_ref)
@@ -701,6 +729,7 @@ def _render_panorama_tab():
             "Tons hoy":       fmt_tons(tons_p_hoy),
             f"Prom {ventana_dias}d": fmt_tons(tons_p_prom),
             "vs prom":        pct_change(tons_p_hoy, tons_p_prom),
+            "Δ sem":          pct_change(tons_sem_act, tons_sem_ant),
             "Campana":        camp_actual,
             # Columna interna para ordenar por valor numerico real, ya que la
             # columna "Tons hoy" esta formateada como string ("46K").
@@ -1138,19 +1167,37 @@ def _render_productos_tab(fecha_ref):
 
         pct_magyp = (tons_actual / prod_magyp_tm * 100) if prod_magyp_tm else None
 
-        k1, k2, k3, k4 = st.columns(4)
+        # Ritmo semanal: ultima semana vs misma semana de la campana anterior.
+        # Detecta desaceleraciones antes de que se vean en el acumulado.
+        semana_prd_actual = df_actual[df_actual["dia_campana"].between(
+            max(1, dia_actual - 6), dia_actual
+        )]["quantity"].fillna(0).sum()
+        semana_prd_ant_acum = []
+        for camp in campanas_ant[1:]:
+            sub_s = df_prd[(df_prd["campana"] == camp) &
+                           (df_prd["dia_campana"].between(max(1, dia_actual - 6), dia_actual))]
+            semana_prd_ant_acum.append(sub_s["quantity"].fillna(0).sum())
+        mediana_semana_hist = np.median(semana_prd_ant_acum) if semana_prd_ant_acum else 0
+
+        k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric(f"Acumulado {campana_actual} a hoy", fmt_tons(tons_actual))
         k2.metric("Mediana ultimas 5", fmt_tons(tons_mediana_hist))
         k3.metric("vs mediana", pct_change(tons_actual, tons_mediana_hist))
+        k4.metric(
+            "Ritmo ult 7d",
+            fmt_tons(semana_prd_actual),
+            delta=pct_change(semana_prd_actual, mediana_semana_hist),
+            help="Toneladas últimos 7 días vs mismo período en campañas anteriores. Señal temprana de aceleración/desaceleración.",
+        )
         if pct_magyp is not None:
-            k4.metric(
+            k5.metric(
                 "% prod MAGyP",
                 f"{pct_magyp:.1f}%",
                 delta=f"{prod_magyp_tm/1_000_000:.1f} Mt ({prod_magyp_camp})",
                 delta_color="off",
             )
         else:
-            k4.metric("Promedio ultimas 5", fmt_tons(tons_promedio_hist))
+            k5.metric("Promedio ultimas 5", fmt_tons(tons_promedio_hist))
 
         st.divider()
 
@@ -1406,15 +1453,31 @@ def _render_productos_tab(fecha_ref):
             total_lineup = float(lineup_mensual.sum())
             total_pend = float(pendiente.sum())
             ratio_pend = (total_pend / total_djve * 100) if total_djve else 0
-            wk1, wk2, wk3 = st.columns(3)
+
+            # Dias de cobertura: pendiente / ritmo diario promedio 30d.
+            ritmo_30d = semana_prd_actual / 7 if semana_prd_actual else None
+            dias_cobertura = int(total_pend / ritmo_30d) if ritmo_30d else None
+
+            wk1, wk2, wk3, wk4 = st.columns(4)
             wk1.metric("DJVE 6 meses", fmt_tons(total_djve))
             wk2.metric("Embarcado 6 meses", fmt_tons(total_lineup))
             wk3.metric(
-                "Pendiente acumulado",
+                "📦 Pendiente (panza)",
                 fmt_tons(total_pend),
                 delta=f"{ratio_pend:.0f}% de DJVE sin cargar",
                 delta_color="inverse",
+                help="Ventas declaradas (DJVE) menos lo ya embarcado en line-up. Es la demanda forward implícita que presionará precios.",
             )
+            if dias_cobertura is not None:
+                wk4.metric(
+                    "Días de cobertura",
+                    f"{dias_cobertura}d",
+                    delta="al ritmo de últimos 7d",
+                    delta_color="off",
+                    help="Cuántos días tardaría en embarcar todo el pendiente al ritmo actual.",
+                )
+            else:
+                wk4.metric("Cobertura", "—")
 
         # ------------------- Top shippers de este producto -------------------
         st.divider()
@@ -1578,14 +1641,22 @@ with tab_cng:
             dias_en_puerto=lambda x: (
                 pd.to_datetime(fecha_ref) - pd.to_datetime(x["etb"])
             ).dt.days,
+            # Demora = dias entre ETA esperado y ETB real (cuánto tardó en atracar).
+            # Positivo = llego tarde vs lo prometido; negativo = adelantado.
+            demora_eta=lambda x: (
+                pd.to_datetime(x["etb"]) - pd.to_datetime(x["eta"])
+            ).dt.days,
         )[
             ["zona", "port", "vessel", "cargo", "quantity", "shipper_canon",
-             "etb", "ets", "dias_en_puerto", "remarks"]
+             "eta", "etb", "ets", "dias_en_puerto", "demora_eta", "remarks"]
         ].rename(columns={
             "zona": "Zona", "port": "Puerto", "vessel": "Buque",
             "cargo": "Producto", "quantity": "Tons",
-            "shipper_canon": "Shipper", "etb": "ETB", "ets": "ETS",
-            "dias_en_puerto": "Dias en puerto", "remarks": "Estado",
+            "shipper_canon": "Shipper", "eta": "ETA orig",
+            "etb": "ETB", "ets": "ETS",
+            "dias_en_puerto": "Dias en puerto",
+            "demora_eta": "Demora ETA (d)",
+            "remarks": "Estado",
         })
         df_det = df_det.sort_values(["Zona", "Puerto"])
 
