@@ -379,31 +379,52 @@ def cached_primera_fecha() -> date | None:
     return primera_fecha_cargada()
 
 
-@st.cache_data(ttl=900, show_spinner="Movimiento del dia...")
+@st.cache_data(ttl=86400, show_spinner="Cargando histórico (esto pasa 1×/día)...")
+def cached_master_exports(fecha_max: date) -> pd.DataFrame:
+    """
+    Master cache: TODOS los exports prioritarios de los últimos 5 años,
+    ya normalizados (shipper_canon, origen_alt). Una sola query por día.
+
+    El argumento `fecha_max` se usa SOLO como cache key — pasale
+    `cached_ultima_fecha()` para que cuando entre data nueva el cache se
+    invalide automáticamente.
+
+    Las demás funciones cached_* derivan de este df via slicing pandas
+    (microsegundos), no van más a la DB.
+    """
+    desde = fecha_max - timedelta(days=365 * 5 + 30)
+    return query_exports_prioritarios(fecha_desde=desde, fecha_hasta=fecha_max)
+
+
+@st.cache_data(ttl=900)
 def cached_exports_rango(desde: date, hasta: date) -> pd.DataFrame:
-    """Exports prioritarios entre dos fechas (ya normalizados)."""
-    return query_exports_prioritarios(fecha_desde=desde, fecha_hasta=hasta)
+    """
+    Slice in-memory del master cache. Microsegundos en lugar de roundtrip
+    a Supabase. El master se carga una vez por día.
+    """
+    df = cached_master_exports(cached_ultima_fecha() or hasta)
+    if df.empty:
+        return df
+    fechas = pd.to_datetime(df["fecha_consulta"]).dt.date
+    mask = (fechas >= desde) & (fechas <= hasta)
+    return df[mask].copy()
 
 
-@st.cache_data(ttl=86400, show_spinner="Cargando histórico anual...")
+@st.cache_data(ttl=86400, show_spinner="Agregando histórico...")
 def cached_serie_diaria_hist(desde: date, hasta: date) -> pd.DataFrame:
     """
-    Serie diaria agregada de toneladas agro (ops=LOAD) entre [desde, hasta].
-    Trae SOLO 4 columnas (fecha, cargo, quantity, ops) en lugar del SELECT *,
-    y agrega en pandas por día para reducir memoria. TTL 24h porque la data
-    histórica no cambia.
+    Serie diaria agregada (tons agro LOAD) entre [desde, hasta], derivada
+    del master cache. No toca la DB.
     """
-    from db import query_lineup
-    from config import CODIGOS_PRIORITARIOS
-    df = query_lineup(
-        fecha_desde=desde,
-        fecha_hasta=hasta,
-        cargos=list(CODIGOS_PRIORITARIOS),
-        columns="fecha_consulta,quantity,ops",
-    )
+    df = cached_master_exports(cached_ultima_fecha() or hasta)
     if df.empty:
         return df
     df = df[df["ops"] == "LOAD"]
+    fechas = pd.to_datetime(df["fecha_consulta"]).dt.date
+    mask = (fechas >= desde) & (fechas <= hasta)
+    df = df.loc[mask, ["fecha_consulta", "quantity"]]
+    if df.empty:
+        return df
     df["fecha_consulta"] = pd.to_datetime(df["fecha_consulta"])
     diario = (
         df.groupby(df["fecha_consulta"].dt.date, as_index=False)["quantity"]
@@ -413,19 +434,15 @@ def cached_serie_diaria_hist(desde: date, hasta: date) -> pd.DataFrame:
     return diario
 
 
-@st.cache_data(ttl=600, show_spinner="Historico por producto...")
+@st.cache_data(ttl=900, show_spinner="Histórico por producto...")
 def cached_producto_historico(cargo: str, desde: date, hasta: date) -> pd.DataFrame:
-    """Historico de un producto especifico para analisis de campanas."""
-    df = query_lineup(
-        fecha_desde=desde,
-        fecha_hasta=hasta,
-        cargos=[cargo],
-    )
+    """Slice del master por cargo + rango. No toca la DB."""
+    df = cached_master_exports(cached_ultima_fecha() or hasta)
     if df.empty:
         return df
-    df = df[df["ops"] == "LOAD"].copy()
-    df = aplicar_a_dataframe(df)
-    return df
+    fechas = pd.to_datetime(df["fecha_consulta"]).dt.date
+    mask = (df["cargo"] == cargo) & (fechas >= desde) & (fechas <= hasta)
+    return df[mask].copy()
 
 
 @st.cache_data(ttl=60)
@@ -643,6 +660,11 @@ if estado["cantidad_filas"] == 0:
 fecha_max_db = cached_ultima_fecha() or date.today()
 fecha_min_db = cached_primera_fecha() or date(2020, 1, 1)
 
+# Pre-warm del master cache: una sola pasada al inicio del script
+# que carga ~5 años de exports prioritarios. Las funciones cached_*
+# derivan slices de este master, evitando ~10 queries adicionales.
+_master_warmup = cached_master_exports(fecha_max_db)
+
 
 # ---------------------------------------------------------------------------
 # Sidebar: controles globales
@@ -679,6 +701,7 @@ with st.sidebar:
         "Ventana de analisis",
         options=list(ventana_opciones.keys()),
         index=2,  # default 30 dias
+        key="ventana_dias_global",
     )
     ventana_dias = ventana_opciones[ventana_label]
 
