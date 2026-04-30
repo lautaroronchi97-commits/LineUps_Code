@@ -135,8 +135,9 @@ def obtener_pronostico(zona: str) -> pd.DataFrame:
         "rafaga_kmh":  daily["wind_gusts_10m_max"],
         "codigo":      daily["weather_code"],
     })
-    df["descripcion"] = df["codigo"].apply(lambda c: _descripcion_clima(c)[0])
-    df["emoji"]       = df["codigo"].apply(lambda c: _descripcion_clima(c)[1])
+    descripciones = df["codigo"].map(_descripcion_clima)
+    df["descripcion"] = [d[0] for d in descripciones]
+    df["emoji"]       = [d[1] for d in descripciones]
     return df
 
 

@@ -406,7 +406,8 @@ def cached_en_puerto_ahora(fecha: date) -> pd.DataFrame:
     if df.empty:
         return df
     df = aplicar_a_dataframe(df)
-    df["zona"] = df["port"].apply(zona_de_puerto)
+    mapa_zona = {p: zona_de_puerto(p) for p in df["port"].unique()}
+    df["zona"] = df["port"].map(mapa_zona)
     return df
 
 
@@ -870,7 +871,7 @@ def _render_panorama_tab():
         return
 
     df_panorama["fecha_consulta"] = pd.to_datetime(df_panorama["fecha_consulta"])
-    df_panorama["estado"] = df_panorama["remarks"].apply(clasificar_estado)
+    df_panorama["estado"] = df_panorama["remarks"].map(clasificar_estado)
     df_hoy = df_panorama[df_panorama["fecha_consulta"].dt.date == fecha_ref]
 
     # ------------------- KPI row -------------------
@@ -2190,7 +2191,19 @@ def _render_congestion_tab(fecha_ref):
             continue
 
         df_clima = df_clima.copy()
-        df_clima["riesgo"] = df_clima.apply(clima_mod.clasificar_riesgo, axis=1)
+        # Vectorización: precomputar las series y usar np.select.
+        _codigo = df_clima["codigo"].fillna(0)
+        _lluvia = df_clima["lluvia_mm"].fillna(0)
+        _rafaga = df_clima["rafaga_kmh"].fillna(0)
+        _prob   = df_clima["prob_lluvia"].fillna(0)
+        _cond_alto  = (_codigo >= 95) | (_lluvia > 20) | (_rafaga > 60)
+        _cond_medio = (_lluvia > 5) | (_rafaga > 40) | (_prob > 70)
+        _cond_bajo  = (_lluvia > 1) | (_prob > 40)
+        df_clima["riesgo"] = np.select(
+            [_cond_alto, _cond_medio, _cond_bajo],
+            ["🔴 ALTO", "🟡 MEDIO", "🟢 BAJO"],
+            default="⚪ OK",
+        )
 
         with st.expander(f"☁  {zona}", expanded=True):
             # Fila de 7 tarjetas compactas (una por dia).

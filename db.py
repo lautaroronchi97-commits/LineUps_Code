@@ -163,6 +163,9 @@ def _fetch_all(query_builder) -> list[dict[str, Any]]:
         if len(batch) < FETCH_PAGE_SIZE:
             break
         inicio += FETCH_PAGE_SIZE
+        # Progreso visible cada 10 paginas (10K filas) en queries pesadas.
+        if inicio % (FETCH_PAGE_SIZE * 10) == 0:
+            logger.debug("_fetch_all: %d filas acumuladas...", len(filas))
         if len(filas) >= _FETCH_MAX_ROWS:
             logger.error(
                 "_fetch_all: superado el limite de %d filas. Abortando paginacion. "

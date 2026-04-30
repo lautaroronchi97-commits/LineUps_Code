@@ -175,9 +175,10 @@ def aplicar_a_dataframe(
         df[col_origen] = None
         return df
 
-    pares = df[col_in].apply(canonicalizar_shipper)
-    df[col_canon] = pares.apply(lambda p: p[0])
-    df[col_origen] = pares.apply(lambda p: p[1])
+    # Una sola pasada + tuple unzip vectorizado.
+    pares = df[col_in].map(canonicalizar_shipper)
+    df[col_canon] = [p[0] for p in pares]
+    df[col_origen] = [p[1] for p in pares]
     return df
 
 
