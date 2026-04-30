@@ -214,6 +214,7 @@ def query_lineup(
     cargos: Iterable[str] | None = None,
     shippers: Iterable[str] | None = None,
     solo_agro: bool = False,
+    columns: str = "*",
 ) -> pd.DataFrame:
     """
     Consulta la tabla `lineup` con filtros opcionales y devuelve un DataFrame.
@@ -230,7 +231,7 @@ def query_lineup(
         )
     """
     client = get_client()
-    query = client.table(TABLA_LINEUP).select("*")
+    query = client.table(TABLA_LINEUP).select(columns)
 
     if fecha_desde is not None:
         query = query.gte("fecha_consulta", fecha_desde.isoformat())

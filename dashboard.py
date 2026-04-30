@@ -379,10 +379,38 @@ def cached_primera_fecha() -> date | None:
     return primera_fecha_cargada()
 
 
-@st.cache_data(ttl=120, show_spinner="Movimiento del dia...")
+@st.cache_data(ttl=900, show_spinner="Movimiento del dia...")
 def cached_exports_rango(desde: date, hasta: date) -> pd.DataFrame:
     """Exports prioritarios entre dos fechas (ya normalizados)."""
     return query_exports_prioritarios(fecha_desde=desde, fecha_hasta=hasta)
+
+
+@st.cache_data(ttl=86400, show_spinner="Cargando histórico anual...")
+def cached_serie_diaria_hist(desde: date, hasta: date) -> pd.DataFrame:
+    """
+    Serie diaria agregada de toneladas agro (ops=LOAD) entre [desde, hasta].
+    Trae SOLO 4 columnas (fecha, cargo, quantity, ops) en lugar del SELECT *,
+    y agrega en pandas por día para reducir memoria. TTL 24h porque la data
+    histórica no cambia.
+    """
+    from db import query_lineup
+    from config import CODIGOS_PRIORITARIOS
+    df = query_lineup(
+        fecha_desde=desde,
+        fecha_hasta=hasta,
+        cargos=list(CODIGOS_PRIORITARIOS),
+        columns="fecha_consulta,quantity,ops",
+    )
+    if df.empty:
+        return df
+    df = df[df["ops"] == "LOAD"]
+    df["fecha_consulta"] = pd.to_datetime(df["fecha_consulta"])
+    diario = (
+        df.groupby(df["fecha_consulta"].dt.date, as_index=False)["quantity"]
+        .sum()
+        .rename(columns={"fecha_consulta": "fecha"})
+    )
+    return diario
 
 
 @st.cache_data(ttl=600, show_spinner="Historico por producto...")
@@ -861,7 +889,8 @@ tab_pan, tab_shp, tab_prd, tab_cng = st.tabs([
 # PESTANA 1: PANORAMA
 # ==========================================================================
 
-def _render_panorama_tab():
+@st.fragment
+def _render_panorama_tab(fecha_ref, ventana_dias):
     # Traer 90 dias para poder calcular tendencias y promedios moviles.
     desde = fecha_ref - timedelta(days=90)
     df_panorama = cached_exports_rango(desde, fecha_ref)
@@ -973,36 +1002,28 @@ def _render_panorama_tab():
         daily_tons["ma7"] = daily_tons["tons"].rolling(7, min_periods=1).mean()
 
         # --- Comparativa interanual: año anterior + banda ±1σ histórica ------
-        # Traemos hasta 5 años hacia atrás para calcular la banda estadística.
+        # Histórico liviano: solo 3 columnas, agregado en DB-side a nivel diario.
         _desde_hist = fecha_ref.replace(year=fecha_ref.year - 5)
-        _df_hist = cached_exports_rango(_desde_hist, fecha_ref - timedelta(days=1))
+        _diario_hist = cached_serie_diaria_hist(_desde_hist, fecha_ref - timedelta(days=1))
 
         _df_ant = pd.DataFrame()
         _band_stats = pd.DataFrame()
 
-        if not _df_hist.empty:
-            _df_hist = _df_hist.copy()
-            _df_hist["fecha_consulta"] = pd.to_datetime(_df_hist["fecha_consulta"])
-            _df_hist["_year"] = _df_hist["fecha_consulta"].dt.year
-            _df_hist["_doy"] = _df_hist["fecha_consulta"].dt.dayofyear
-
-            # Agregar tons diarias por año-doy para alinear en eje X.
-            _hist_daily = (
-                _df_hist.groupby(["_year", "_doy"])["quantity"]
-                .sum()
-                .reset_index()
-                .rename(columns={"quantity": "tons"})
-            )
+        if not _diario_hist.empty:
+            _diario_hist = _diario_hist.copy()
+            _fechas = pd.to_datetime(_diario_hist["fecha"])
+            _diario_hist["_year"] = _fechas.dt.year
+            _diario_hist["_doy"]  = _fechas.dt.dayofyear
+            _hist_daily = _diario_hist.rename(columns={"quantity": "tons"})
 
             # --- Año anterior ---
             _anio_ant = fecha_ref.year - 1
             _df_ant_raw = _hist_daily[_hist_daily["_year"] == _anio_ant].copy()
             if not _df_ant_raw.empty:
-                _df_ant_raw["fecha_plot"] = _df_ant_raw["_doy"].apply(
-                    lambda doy: (
-                        date(fecha_ref.year, 1, 1) + timedelta(days=int(doy) - 1)
-                    )
-                )
+                _df_ant_raw["fecha_plot"] = (
+                    pd.Timestamp(date(fecha_ref.year, 1, 1)) +
+                    pd.to_timedelta(_df_ant_raw["_doy"].astype(int) - 1, unit="D")
+                ).dt.date
                 _df_ant = _df_ant_raw
 
             # --- Banda ±1σ (años < año anterior para no contaminar con año ant) ---
@@ -1013,11 +1034,10 @@ def _render_panorama_tab():
                     .agg(media="mean", sigma="std")
                     .reset_index()
                 )
-                _band_stats["fecha_plot"] = _band_stats["_doy"].apply(
-                    lambda doy: (
-                        date(fecha_ref.year, 1, 1) + timedelta(days=int(doy) - 1)
-                    )
-                )
+                _band_stats["fecha_plot"] = (
+                    pd.Timestamp(date(fecha_ref.year, 1, 1)) +
+                    pd.to_timedelta(_band_stats["_doy"].astype(int) - 1, unit="D")
+                ).dt.date
         # ---------------------------------------------------------------------
 
         fig_t = go.Figure()
@@ -1189,7 +1209,8 @@ def _render_panorama_tab():
 # PESTANA 2: SHIPPERS (core)
 # ==========================================================================
 
-def _render_shippers_tab():
+@st.fragment
+def _render_shippers_tab(fecha_ref, ventana_dias):
     # Traemos ~2 anos para poder calcular historia por shipper con robustez.
     desde_shp = fecha_ref - timedelta(days=730)
     df_shp_all = cached_exports_rango(desde_shp, fecha_ref)
@@ -1495,10 +1516,10 @@ def _render_shippers_tab():
 # ==========================================================================
 
 with tab_pan:
-    _render_panorama_tab()
+    _render_panorama_tab(fecha_ref, ventana_dias)
 
 with tab_shp:
-    _render_shippers_tab()
+    _render_shippers_tab(fecha_ref, ventana_dias)
 
 
 # ==========================================================================
