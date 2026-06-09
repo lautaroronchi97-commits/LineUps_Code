@@ -41,6 +41,50 @@ logger = setup_logging(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Session reutilizable (una sola por proceso)
+# ---------------------------------------------------------------------------
+
+# Headers que imitan un browser real. Ayudan a evitar bloqueos 403 desde
+# IPs de cloud/CI donde el servidor filtra por heuristicas de UA o headers.
+_BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": BASE_URL,
+    "Connection": "keep-alive",
+}
+
+_session: requests.Session | None = None
+
+
+def _get_session() -> requests.Session:
+    """
+    Devuelve la Session HTTP reutilizable del proceso, creandola la primera
+    vez. Reusar la Session activa keep-alive y propaga cookies automaticamente
+    (incluido PHPSESSID si el servidor PHP las emite).
+    """
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update(_BROWSER_HEADERS)
+        # Cookie warm-up: un GET a la URL base sin parametros para que el
+        # servidor PHP pueda emitir PHPSESSID y cualquier cookie de sesion
+        # que necesite antes del primer request de datos.
+        try:
+            warmup = _session.get(BASE_URL, timeout=REQUEST_TIMEOUT)
+            logger.debug(
+                "Cookie warm-up completado (status=%d, cookies=%s).",
+                warmup.status_code,
+                list(_session.cookies.keys()),
+            )
+        except requests.RequestException as exc:
+            # El warm-up es un best-effort: si falla, seguimos igual.
+            logger.warning("Cookie warm-up fallido (continuando de todas formas): %s", exc)
+    return _session
+
+
+# ---------------------------------------------------------------------------
 # Fetch HTML
 # ---------------------------------------------------------------------------
 
@@ -62,17 +106,26 @@ def fetch_lineup_html(fecha: date) -> str:
         "select_year": f"{fecha.year:04d}",
         "mode": "Search",
     }
-    headers = {"User-Agent": USER_AGENT}
+
+    session = _get_session()
 
     ultimo_error: Exception | None = None
     for intento in range(1, MAX_RETRIES + 2):  # primer intento + reintentos
         try:
-            resp = requests.get(
+            resp = session.get(
                 BASE_URL,
                 params=params,
-                headers=headers,
                 timeout=REQUEST_TIMEOUT,
             )
+            if resp.status_code == 403:
+                logger.debug(
+                    "403 Forbidden al bajar %s (intento %d). "
+                    "Content-Type: %s | Server: %s",
+                    fecha,
+                    intento,
+                    resp.headers.get("Content-Type", "(ausente)"),
+                    resp.headers.get("Server", "(ausente)"),
+                )
             resp.raise_for_status()
             # Validar Content-Type: si ISA devuelve una pagina de bloqueo o login
             # wall con 200-OK, lo detectamos antes de intentar parsear la tabla.
