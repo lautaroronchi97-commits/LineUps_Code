@@ -54,6 +54,7 @@ CANONICAL_MAP: list[tuple[str, list[str]]] = [
         r"\bLDC\b",
         r"LOUIS\s+DREYFUS",
         r"\bDREYFUS\b",
+        r"LD\s+COMMODITIES",
     ]),
     ("ADM", [
         r"\bADM\b",
@@ -63,12 +64,14 @@ CANONICAL_MAP: list[tuple[str, list[str]]] = [
     ("AGD", [
         r"\bAGD\b",
         r"ACEITERA\s+GENERAL\s+DEHEZA",
+        r"ACEITERA\s+GEN\s+DEHEZA",
         r"\bDEHEZA\b",
     ]),
     ("ACA", [
         r"\bACA\b",
         r"ASOC\.?\s+COOPERATIVAS",
         r"ASOCIACION\s+DE\s+COOPERATIVAS",
+        r"ASOC\s+COOP\s+ARG",
     ]),
     ("MOLINOS", [
         r"\bMOLINOS\b",  # cubre "MOLINOS AGRO" y "MOLINOS RIO DE LA PLATA"
@@ -180,6 +183,34 @@ def aplicar_a_dataframe(
     df[col_canon] = [p[0] for p in pares]
     df[col_origen] = [p[1] for p in pares]
     return df
+
+
+# ---------------------------------------------------------------------------
+# Utilidad de diagnostico
+# ---------------------------------------------------------------------------
+
+def shippers_desconocidos(df: pd.DataFrame, col: str = "shipper") -> pd.Series:
+    """
+    Devuelve los valores unicos de df[col] que no matchearon ningun patron
+    (canonico == "OTROS"), ordenados por frecuencia descendente.
+
+    Util para detectar nuevos shippers que necesiten mapeo.
+
+    Args:
+        df:  DataFrame que contiene la columna de shippers.
+        col: nombre de la columna con los valores brutos (default "shipper").
+
+    Returns:
+        pd.Series con index = valor_bruto y values = frecuencia,
+        ordenada de mayor a menor frecuencia. Nombre de la serie: col.
+    """
+    if col not in df.columns:
+        return pd.Series([], name=col, dtype=object)
+
+    mascara_otros = df[col].map(lambda v: canonicalizar_shipper(v)[0] == "OTROS")
+    conteos = df.loc[mascara_otros, col].value_counts()
+    conteos.name = col
+    return conteos
 
 
 # ---------------------------------------------------------------------------
