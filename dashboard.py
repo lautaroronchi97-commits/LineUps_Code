@@ -77,7 +77,6 @@ from config import (
     zona_de_puerto,
 )
 from db import (
-    djve_ultima_actualizacion,
     ping,
     primera_fecha_cargada,
     query_djve,
@@ -363,27 +362,27 @@ def cached_ping() -> dict:
     return ping()
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=900)
 def cached_ultima_fecha() -> date | None:
     return ultima_fecha_cargada()
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=900)
 def cached_ultima_actualizacion() -> datetime | None:
     """Timestamp de la ultima fila insertada en lineup (cron diario)."""
     return ultima_actualizacion_lineup()
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=900)
 def cached_primera_fecha() -> date | None:
     return primera_fecha_cargada()
 
 
-@st.cache_data(ttl=86400, show_spinner="Cargando histórico (esto pasa 1×/día)...")
+@st.cache_data(ttl=900, show_spinner="Cargando histórico...")
 def cached_master_exports(fecha_max: date) -> pd.DataFrame:
     """
     Master cache: TODOS los exports prioritarios de los últimos 5 años,
-    ya normalizados (shipper_canon, origen_alt). Una sola query por día.
+    ya normalizados (shipper_canon, origen_alt).
 
     El argumento `fecha_max` se usa SOLO como cache key — pasale
     `cached_ultima_fecha()` para que cuando entre data nueva el cache se
@@ -410,7 +409,7 @@ def cached_exports_rango(desde: date, hasta: date) -> pd.DataFrame:
     return df[mask].copy()
 
 
-@st.cache_data(ttl=86400, show_spinner="Agregando histórico...")
+@st.cache_data(ttl=900, show_spinner="Agregando histórico...")
 def cached_serie_diaria_hist(desde: date, hasta: date) -> pd.DataFrame:
     """
     Serie diaria agregada (tons agro LOAD) entre [desde, hasta], derivada
@@ -445,7 +444,7 @@ def cached_producto_historico(cargo: str, desde: date, hasta: date) -> pd.DataFr
     return df[mask].copy()
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=900)
 def cached_en_puerto_ahora(fecha: date) -> pd.DataFrame:
     df = query_en_puerto_ahora(fecha)
     if df.empty:
@@ -466,7 +465,7 @@ def cached_clima_zonas() -> dict[str, pd.DataFrame]:
     return clima_mod.pronostico_todas_zonas()
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=900)
 def cached_serie_congestion(desde: date, hasta: date) -> pd.DataFrame:
     """
     Para cada dia en [desde, hasta]: cuantos buques tenian etb<=dia<=ets.
@@ -499,24 +498,18 @@ def cached_serie_congestion(desde: date, hasta: date) -> pd.DataFrame:
     )
 
 
-@st.cache_data(ttl=600, show_spinner="Cargando DJVE...")
+@st.cache_data(ttl=900, show_spinner="Cargando DJVE...")
 def cached_djve(anio: int) -> pd.DataFrame:
     """
     DJVE acumuladas (declaraciones juradas de ventas al exterior).
 
-    Prioriza leer de la tabla `djve` de Supabase (la pisa diariamente
-    update_djve.py). Si la tabla esta vacia para el ano pedido, hace
-    fallback a descargar el XLSX del MAGyP online (~30s).
+    Lee exclusivamente de la tabla `djve` de Supabase (pisada diariamente
+    por update_djve.py). El dashboard nunca descarga el XLSX del MAGyP
+    para evitar latencias de 30-60s y dependencias de red en cada render.
 
-    Cache 10 min: ya que DJVE se actualiza una vez al dia, 10 min en cache
-    es mas que suficiente y evita hammerear la DB.
+    Cache 15 min (ttl=900): coherente con el resto de datos Supabase.
     """
-    df_db = query_djve(anio=anio)
-    if not df_db.empty:
-        return df_db
-
-    # Fallback: tabla vacia o el scheduled todavia no corrio.
-    return fob_djve.descargar_djve_acumuladas(anio)
+    return query_djve(anio=anio)
 
 
 @st.cache_data(ttl=86400, show_spinner="Descargando estimaciones MAGyP...")
@@ -546,7 +539,7 @@ def _senal_zscore(z: float) -> str:
     return "🔴 MUY BAJO"
 
 
-@st.cache_data(ttl=300, show_spinner="Calculando z-scores...")
+@st.cache_data(ttl=900, show_spinner="Calculando z-scores...")
 def _calcular_zscores_shippers(
     df_shp_all: pd.DataFrame,
     fecha_ref: date,
@@ -1805,8 +1798,9 @@ def _render_productos_tab(fecha_ref):
         df_djve = cached_djve(fecha_ref.year)
         if df_djve.empty:
             st.info(
-                "No pude descargar DJVE del MAGyP. "
-                "El servidor a veces devuelve 403/timeout; reintentar."
+                "Sin DJVE en Supabase para este ano. "
+                "update_djve.py sincroniza la tabla diariamente; "
+                "si la tabla aun esta vacia, correr `python update_djve.py` manualmente."
             )
         else:
             # Serie diaria de toneladas para este producto.
