@@ -66,11 +66,17 @@ import plotly.graph_objects as go
 
 import campanas
 import clima as clima_mod
+import estacional
 import estimaciones as estim_mod
 import fob_djve
+import mesa_calor
+import mesa_diff
+import mesa_embarque
 from config import (
     BLOOMBERG_PALETTE,
     CODIGOS_PRIORITARIOS,
+    MESA_DIR_COLORS,
+    MESA_HEAT_COLORS,
     PRODUCTO_DISPLAY,
     PRODUCTOS_PRIORITARIOS,
     SHIPPER_COLORS,
@@ -544,6 +550,352 @@ def cached_fas_perfiles(fecha_ref: date) -> dict[tuple[str, str], dict]:
     return perfiles
 
 
+# ---------------------------------------------------------------------------
+# Capa de datos de la pestaña MESA (índice de calor de mercadería)
+# ---------------------------------------------------------------------------
+
+# Productos de la mesa y los códigos del line-up que cada uno agrega.
+_MESA_PRODUCTOS = ["MAIZE", "WHEAT", "SOJA_CRUSH", "SBS"]
+
+
+def _snapshot_lineup(master: pd.DataFrame, fecha_snap: date) -> pd.DataFrame:
+    """Line-up tal como se vio en una fecha de consulta (snapshot exacto)."""
+    if master.empty:
+        return master
+    fechas = pd.to_datetime(master["fecha_consulta"], errors="coerce").dt.date
+    return master[fechas == fecha_snap].copy()
+
+
+def _fechas_snapshot_disponibles(master: pd.DataFrame) -> list[date]:
+    """Fechas de consulta únicas (snapshots) disponibles, ordenadas."""
+    if master.empty:
+        return []
+    fechas = pd.to_datetime(master["fecha_consulta"], errors="coerce").dt.date
+    return sorted({f for f in fechas if f is not None})
+
+
+@st.cache_data(ttl=3600)
+def cached_djve_multianio(anios: tuple[int, ...]) -> pd.DataFrame:
+    """DJVE de varios años concatenadas (para reconstrucción as-of histórica)."""
+    frames = []
+    for a in anios:
+        try:
+            df = cached_djve(a)
+        except Exception:
+            df = pd.DataFrame()
+        if not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _djve_asof(df_djve: pd.DataFrame, fecha: date) -> pd.DataFrame:
+    """DJVE conocidas a una fecha: fecha_registro <= fecha."""
+    if df_djve.empty or "fecha_registro" not in df_djve.columns:
+        return df_djve
+    freg = pd.to_datetime(df_djve["fecha_registro"], errors="coerce").dt.date
+    return df_djve[freg.notna() & (freg <= fecha)].copy()
+
+
+def _serie_estacional_metricas(
+    master: pd.DataFrame,
+    df_djve_hist: pd.DataFrame,
+    producto: str,
+    fecha_ref: date,
+    snapshots: list[date],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Construye las series históricas estacionales de gap y de tonelaje line-up.
+
+    Para cada snapshot que cae en alguna ventana estacional (±15d de la
+    fecha-equivalente en las últimas campañas), calcula el gap de cobertura y el
+    tonelaje del line-up de ese día. Devuelve dos series listas para
+    `estacional.percentil_estacional`.
+    """
+    cod_camp = "SBM" if producto == "SOJA_CRUSH" else producto
+    ventanas = estacional.fechas_estacionales(cod_camp, fecha_ref)
+    if not ventanas:
+        vacio = estacional.construir_serie([])
+        return vacio, vacio
+
+    desde_global = min(d for _, d, _ in ventanas)
+    hasta_global = max(h for _, _, h in ventanas)
+
+    def _en_alguna_ventana(d: date) -> bool:
+        return any(di <= d <= hi for _, di, hi in ventanas)
+
+    reg_gap: list[tuple[date, str, float]] = []
+    reg_ton: list[tuple[date, str, float]] = []
+    for snap in snapshots:
+        if snap < desde_global or snap > hasta_global:
+            continue
+        if not _en_alguna_ventana(snap):
+            continue
+        lineup_d = _snapshot_lineup(master, snap)
+        djve_d = _djve_asof(df_djve_hist, snap)
+        gap_d = mesa_calor.gap_cobertura(djve_d, lineup_d, snap, producto)
+        ton_d = mesa_calor.tonelaje_lineup(lineup_d, snap, producto)
+        reg_gap.append((snap, producto, gap_d))
+        reg_ton.append((snap, producto, ton_d))
+
+    return (estacional.construir_serie(reg_gap),
+            estacional.construir_serie(reg_ton))
+
+
+@st.cache_data(ttl=3600, show_spinner="MESA · calculando índice de calor...")
+def cached_mesa_estado(fecha_ref: date) -> dict:
+    """
+    Estado completo de la pestaña MESA para una fecha.
+
+    Devuelve un dict con, por producto: calor, banda, dirección, gap, delta vs
+    ayer, percentiles de componentes y la serie del sparkline. Además: el
+    snapshot de hoy/ayer, la matriz por mes de embarque y el estado de ayer
+    (para el diff). Degrada con gracia si falta historia (None → SIN HISTORIA).
+    """
+    master = cached_master_exports(cached_ultima_fecha() or fecha_ref)
+    snapshots = _fechas_snapshot_disponibles(master)
+    snap_hoy = max((s for s in snapshots if s <= fecha_ref), default=None)
+    snap_ayer = max((s for s in snapshots if snap_hoy and s < snap_hoy),
+                    default=None)
+
+    # DJVE: año actual + anterior para reconstrucción as-of.
+    djve_hist = cached_djve_multianio((fecha_ref.year, fecha_ref.year - 1))
+    djve_hoy = _djve_asof(djve_hist, snap_hoy) if snap_hoy else pd.DataFrame()
+
+    # Compras MAGyP (farmer selling). Puede venir vacío (degrada a None).
+    try:
+        df_compras = cached_compras_fas()
+    except Exception:
+        df_compras = pd.DataFrame()
+
+    estado: dict = {
+        "snap_hoy": snap_hoy,
+        "snap_ayer": snap_ayer,
+        "productos": {},
+        "estado_ayer": {},
+    }
+    if snap_hoy is None:
+        return estado
+
+    lineup_hoy = _snapshot_lineup(master, snap_hoy)
+    lineup_ayer = _snapshot_lineup(master, snap_ayer) if snap_ayer else pd.DataFrame()
+    # Snapshot ~K días atrás para la dirección del gap.
+    snap_k = max((s for s in snapshots
+                  if s <= snap_hoy - timedelta(days=mesa_calor.K_MOMENTUM_DIAS)),
+                 default=snap_ayer)
+    lineup_k = _snapshot_lineup(master, snap_k) if snap_k else pd.DataFrame()
+
+    for prod in _MESA_PRODUCTOS:
+        cod_camp = "SBM" if prod == "SOJA_CRUSH" else prod
+
+        gap_hoy = mesa_calor.gap_cobertura(djve_hoy, lineup_hoy, snap_hoy, prod)
+        ton_hoy = mesa_calor.tonelaje_lineup(lineup_hoy, snap_hoy, prod)
+
+        serie_gap, serie_ton = _serie_estacional_metricas(
+            master, djve_hist, prod, fecha_ref, snapshots
+        )
+        pctl_gap = estacional.percentil_estacional(
+            serie_gap, prod, fecha_ref, gap_hoy
+        )
+        pctl_ton = estacional.percentil_estacional(
+            serie_ton, prod, fecha_ref, ton_hoy
+        )
+
+        # C3 farmer selling: avance de comercialización vs campañas previas.
+        pctl_farmer = _pctl_farmer_selling(df_compras, cod_camp, fecha_ref)
+
+        calor = mesa_calor.indice_calor(pctl_gap, pctl_ton, pctl_farmer)
+        banda = mesa_calor.clasificar_banda(calor)
+
+        # Dirección del gap (momentum).
+        gap_k = mesa_calor.gap_cobertura(djve_hoy, lineup_k, snap_k, prod) \
+            if snap_k else gap_hoy
+        delta_gap = gap_hoy - gap_k
+        direccion = mesa_calor.clasificar_direccion(delta_gap)
+
+        # Delta del índice vs ayer.
+        calor_ayer = None
+        if snap_ayer is not None:
+            gap_ayer = mesa_calor.gap_cobertura(
+                _djve_asof(djve_hist, snap_ayer), lineup_ayer, snap_ayer, prod
+            )
+            ton_ayer = mesa_calor.tonelaje_lineup(lineup_ayer, snap_ayer, prod)
+            pg = estacional.percentil_estacional(serie_gap, prod, snap_ayer, gap_ayer)
+            pt = estacional.percentil_estacional(serie_ton, prod, snap_ayer, ton_ayer)
+            pf = _pctl_farmer_selling(df_compras, cod_camp, snap_ayer)
+            calor_ayer = mesa_calor.indice_calor(pg, pt, pf)
+
+        delta_calor = (calor - calor_ayer) if (calor is not None
+                                               and calor_ayer is not None) else None
+
+        # Sparkline: índice sobre los últimos ~30 días de snapshots.
+        spark = _serie_indice_trailing(
+            master, djve_hist, df_compras, prod, cod_camp,
+            serie_gap, serie_ton, snapshots, snap_hoy
+        )
+
+        estado["productos"][prod] = {
+            "calor": calor,
+            "banda": banda,
+            "direccion": direccion,
+            "gap_tn": gap_hoy,
+            "delta_gap": delta_gap,
+            "calor_ayer": calor_ayer,
+            "delta_calor": delta_calor,
+            "pctl_gap": pctl_gap,
+            "pctl_lineup": pctl_ton,
+            "pctl_farmer": pctl_farmer,
+            "spark": spark,
+        }
+        estado["estado_ayer"][prod] = {
+            "calor": calor_ayer,
+            "banda": mesa_calor.clasificar_banda(calor_ayer),
+            "direccion": direccion,  # aproximación: dirección estable día a día
+            "gap_tn": gap_hoy - delta_gap,
+        }
+
+    return estado
+
+
+def _serie_indice_trailing(
+    master, djve_hist, df_compras, prod, cod_camp,
+    serie_gap, serie_ton, snapshots, snap_hoy, n_dias=30,
+) -> list[float]:
+    """Serie del índice de calor sobre los últimos n_dias de snapshots (sparkline)."""
+    inicio = snap_hoy - timedelta(days=n_dias)
+    fechas = [s for s in snapshots if inicio <= s <= snap_hoy]
+    if len(fechas) > 15:  # submuestreo para no recalcular de más
+        paso = max(1, len(fechas) // 15)
+        fechas = fechas[::paso]
+    valores: list[float] = []
+    for f in fechas:
+        lineup_f = _snapshot_lineup(master, f)
+        djve_f = _djve_asof(djve_hist, f)
+        gap_f = mesa_calor.gap_cobertura(djve_f, lineup_f, f, prod)
+        ton_f = mesa_calor.tonelaje_lineup(lineup_f, f, prod)
+        pg = estacional.percentil_estacional(serie_gap, prod, f, gap_f)
+        pt = estacional.percentil_estacional(serie_ton, prod, f, ton_f)
+        pf = _pctl_farmer_selling(df_compras, cod_camp, f)
+        c = mesa_calor.indice_calor(pg, pt, pf)
+        if c is not None:
+            valores.append(c)
+    return valores
+
+
+def _pctl_farmer_selling(df_compras: pd.DataFrame, codigo: str,
+                         fecha: date) -> float | None:
+    """
+    Percentil del avance de comercialización del productor vs campañas previas.
+
+    Avance = % cosecha comercializado a la fecha. Se compara contra el avance en
+    la misma semana de campaña de años previos. Devuelve None si no hay dato.
+    """
+    if df_compras is None or df_compras.empty:
+        return None
+    try:
+        import compras_fas
+    except Exception:
+        return None
+    camp_actual = campanas.campana_de(codigo, fecha)
+    avance_hoy = compras_fas.porcentaje_cosecha_comercializado(
+        df_compras, codigo, camp_actual
+    )
+    if avance_hoy is None:
+        return None
+    previas = campanas.campanas_anteriores(codigo, fecha, n=5)
+    valores = []
+    for camp in previas:
+        v = compras_fas.porcentaje_cosecha_comercializado(df_compras, codigo, camp)
+        if v is not None:
+            valores.append(v)
+    if len(valores) < 2:
+        return None
+    return estacional.percentil_en_serie(valores, float(avance_hoy))
+
+
+@st.cache_data(ttl=3600)
+def cached_compras_fas() -> pd.DataFrame:
+    """Compras MAGyP (farmer selling). Degrada a vacío si no hay red/datos."""
+    try:
+        import compras_fas
+        return compras_fas.descargar_compras(timeout=20)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner="MESA · matriz por mes de embarque...")
+def cached_mesa_embarque(fecha_ref: date) -> dict:
+    """Matriz producto × mes de embarque con percentil estacional por mes."""
+    master = cached_master_exports(cached_ultima_fecha() or fecha_ref)
+    snapshots = _fechas_snapshot_disponibles(master)
+    snap_hoy = max((s for s in snapshots if s <= fecha_ref), default=None)
+    if snap_hoy is None:
+        return {"meses": [], "filas": {}}
+
+    djve_hist = cached_djve_multianio((fecha_ref.year, fecha_ref.year - 1))
+    djve_hoy = _djve_asof(djve_hist, snap_hoy)
+    lineup_hoy = _snapshot_lineup(master, snap_hoy)
+
+    meses = mesa_embarque.meses_proximos(fecha_ref, 6)
+    filas: dict[str, list[dict]] = {}
+    for prod in ["MAIZE", "SOJA_CRUSH", "WHEAT"]:
+        gm = mesa_embarque.gap_por_mes(djve_hoy, lineup_hoy, fecha_ref, prod, 6)
+        celdas = []
+        for _, r in gm.iterrows():
+            # Percentil del gap del mes vs el mismo mes en años previos.
+            pctl = _pctl_gap_mes(
+                master, djve_hist, prod, int(r["anio"]), int(r["mes"]),
+                snapshots
+            )
+            celdas.append({
+                "anio": int(r["anio"]),
+                "mes": int(r["mes"]),
+                "gap_tn": float(r["gap_tn"]),
+                "declarado_tn": float(r["declarado_tn"]),
+                "originado_tn": float(r["originado_tn"]),
+                "n_buques": int(r["n_buques"]),
+                "pctl": pctl,
+            })
+        filas[prod] = celdas
+    return {"meses": meses, "filas": filas}
+
+
+def _pctl_gap_mes(master, djve_hist, prod, anio, mes, snapshots,
+                  n_anios=4) -> float | None:
+    """Percentil del gap de un mes de embarque vs el mismo mes en años previos."""
+    # Gap actual del mes (desde el snapshot más reciente).
+    snap_hoy = max(snapshots) if snapshots else None
+    if snap_hoy is None:
+        return None
+    lineup_hoy = _snapshot_lineup(master, snap_hoy)
+    djve_hoy = _djve_asof(djve_hist, snap_hoy)
+    gm_actual = mesa_embarque.gap_por_mes(djve_hoy, lineup_hoy, snap_hoy, prod, 6)
+    fila_act = gm_actual[(gm_actual["anio"] == anio) & (gm_actual["mes"] == mes)]
+    if fila_act.empty:
+        return None
+    gap_actual = float(fila_act.iloc[0]["gap_tn"])
+
+    # Historia: mismo mes calendario en años previos, leído desde snapshots ~60d antes.
+    valores = []
+    for k in range(1, n_anios + 1):
+        anio_h = anio - k
+        # Snapshot histórico de referencia: ~mismos días antes del mes.
+        ref_h = date(anio_h, mes, 1) - timedelta(days=30)
+        snap_h = max((s for s in snapshots if s <= ref_h), default=None)
+        if snap_h is None:
+            continue
+        lineup_h = _snapshot_lineup(master, snap_h)
+        djve_h = _djve_asof(djve_hist, snap_h)
+        gm_h = mesa_embarque.gap_por_mes(djve_h, lineup_h, snap_h, prod, 12)
+        fila_h = gm_h[(gm_h["anio"] == anio_h) & (gm_h["mes"] == mes)]
+        if not fila_h.empty:
+            valores.append(float(fila_h.iloc[0]["gap_tn"]))
+    if len(valores) < 2:
+        return None
+    return estacional.percentil_en_serie(valores, gap_actual)
+
+
 @st.cache_data(ttl=86400, show_spinner="Descargando estimaciones MAGyP...")
 def cached_estimaciones() -> pd.DataFrame:
     """
@@ -925,13 +1277,593 @@ _render_senales_hoy()
 # Pestanas
 # ===========================================================================
 
-tab_pan, tab_shp, tab_prd, tab_cng, tab_fas = st.tabs([
+tab_mesa, tab_pan, tab_shp, tab_prd, tab_cng, tab_fas = st.tabs([
+    "🔥 MESA",
     "📊 PANORAMA",
     "🏢 SHIPPERS",
     "🌾 PRODUCTOS",
     "⚓ CONGESTION",
     "🎯 COMPRADORES FAS",
 ])
+
+
+# ==========================================================================
+# PESTANA 0: MESA — Calor de mercadería
+# ==========================================================================
+
+_MES_ABBR = {1: "ENE", 2: "FEB", 3: "MAR", 4: "ABR", 5: "MAY", 6: "JUN",
+             7: "JUL", 8: "AGO", 9: "SEP", 10: "OCT", 11: "NOV", 12: "DIC"}
+
+# Tags del tape por tipo de evento → color del borde.
+_MESA_TAG_COLOR = {
+    "GAP": BLOOMBERG_PALETTE["accent"],
+    "BUQUE": BLOOMBERG_PALETTE["accent_blue"],
+    "DJVE": BLOOMBERG_PALETTE["accent_blue"],
+}
+
+
+def _mesa_css() -> str:
+    """CSS propio de la pestaña MESA (inyectado una vez por render)."""
+    p = BLOOMBERG_PALETTE
+    return f"""
+    <style>
+    .mesa-card {{
+        background:{p['bg_card']}; border:1px solid {p['border']};
+        border-radius:2px; padding:12px 12px 10px 12px; min-height:236px;
+        position:relative;
+    }}
+    .mesa-prod {{ font-size:11px; letter-spacing:0.12em; color:{p['text_muted']};
+        text-transform:uppercase; font-weight:700; }}
+    .mesa-hero {{ font-size:44px; font-weight:700; line-height:1.0; }}
+    .mesa-chip {{ font-size:10px; text-transform:uppercase; font-weight:700;
+        padding:2px 6px; border-radius:2px; border:1px solid; letter-spacing:0.06em; }}
+    .mesa-dir {{ font-size:12px; font-weight:700; }}
+    .mesa-sub {{ font-size:10px; color:{p['text_muted']}; }}
+    .mesa-sep {{ border-top:1px solid {p['border']}; margin:8px 0 6px 0; }}
+    .mesa-accion {{ font-size:12px; font-weight:700; color:{p['text_primary']}; }}
+    .mesa-foot {{ font-size:9px; color:{p['text_muted']}; letter-spacing:0.04em;
+        text-transform:uppercase; margin-top:6px; }}
+    .mesa-spark {{ position:absolute; top:10px; right:10px; }}
+    .mesa-tape {{ background:{p['bg_card']}; border:1px solid {p['border']};
+        border-radius:2px; padding:2px 0; }}
+    .mesa-line {{ font-size:11px; color:{p['text_primary']}; padding:4px 10px;
+        border-left:3px solid {p['text_muted']}; margin:2px 0; }}
+    .mesa-tagb {{ font-size:9px; font-weight:700; text-transform:uppercase;
+        letter-spacing:0.06em; }}
+    .mesa-bullet-track {{ background:{p['bg_hover']}; height:6px; border-radius:2px;
+        width:100%; position:relative; }}
+    .mesa-bullet-fill {{ height:6px; border-radius:2px; }}
+    </style>
+    """
+
+
+def _mesa_banda_style(banda: str) -> tuple[str, str]:
+    """Devuelve (color_texto, color_fondo_chip) de una banda."""
+    d = MESA_HEAT_COLORS.get(banda, MESA_HEAT_COLORS["SIN HISTORIA"])
+    return d["color"], d["bg"]
+
+
+def _mesa_tape_html(eventos: list[dict], fecha_ayer) -> str:
+    """Construye el HTML del tape 'qué cambió desde ayer'."""
+    if not eventos:
+        ref = fecha_ayer.isoformat() if fecha_ayer else "—"
+        return (f"<div class='mesa-tape'><div class='mesa-line'>"
+                f"SIN CAMBIOS MATERIALES VS {ref}</div></div>")
+
+    lineas = []
+    for ev in eventos:
+        tipo = ev["tipo"]
+        prod = mesa_calor.PRODUCTO_DISPLAY_MESA.get(
+            ev.get("producto"), ev.get("producto", "—"))
+        prod = (prod or "—").upper()
+        if tipo == "DIR":
+            color = MESA_DIR_COLORS.get(ev["hasta"], BLOOMBERG_PALETTE["text_muted"])
+            g_des = mesa_calor.DIRECCION_LABEL.get(ev["desde"], ev["desde"])
+            g_has = mesa_calor.DIRECCION_LABEL.get(ev["hasta"], ev["hasta"])
+            fl = mesa_calor.DIRECCION_GLIFO.get(ev["hasta"], "")
+            texto = (f"pasó de {g_des} a {g_has} {fl} "
+                     f"(Δgap 10d: {fmt_tons(ev.get('detalle'))})")
+            tag = "DIR"
+        elif tipo == "BANDA":
+            color, _ = _mesa_banda_style(ev["hasta"])
+            cd = ev.get("calor_desde")
+            ch = ev.get("calor_hasta")
+            cd_s = f"{cd:.0f}" if cd is not None else "—"
+            ch_s = f"{ch:.0f}" if ch is not None else "—"
+            texto = f"{ev['desde']} → {ev['hasta']} · calor {cd_s} → {ch_s}"
+            tag = "BANDA"
+        elif tipo == "GAP":
+            color = _MESA_TAG_COLOR["GAP"]
+            signo = "+" if ev.get("delta", 0) >= 0 else ""
+            texto = (f"gap 30d {signo}{fmt_tons(ev.get('delta'))} "
+                     f"(de {fmt_tons(ev.get('desde'))} a {fmt_tons(ev.get('hasta'))})")
+            tag = "GAP"
+        elif tipo == "BUQUE":
+            color = _MESA_TAG_COLOR["BUQUE"]
+            shp = ev.get("shipper") or "—"
+            etb = ev.get("etb")
+            etb_s = etb.isoformat() if hasattr(etb, "isoformat") else str(etb)
+            texto = (f"{shp} nominó buque {fmt_tons(ev.get('toneladas'))} en "
+                     f"{ev.get('puerto','—')}, ETB {etb_s}")
+            tag = "BUQUE"
+        else:  # DJVE
+            color = _MESA_TAG_COLOR["DJVE"]
+            shp = ev.get("shipper") or "—"
+            texto = f"{shp} registró {fmt_tons(ev.get('toneladas'))}"
+            tag = "DJVE"
+
+        lineas.append(
+            f"<div class='mesa-line' style='border-left-color:{color};'>"
+            f"<span class='mesa-tagb' style='color:{color};'>[{tag}]</span> "
+            f"<span style='font-weight:700;'>{prod}</span> {texto}</div>"
+        )
+    return "<div class='mesa-tape'>" + "".join(lineas) + "</div>"
+
+
+def _mesa_card_html(prod: str, info: dict) -> str:
+    """HTML de una card de calor de producto."""
+    p = BLOOMBERG_PALETTE
+    nombre = mesa_calor.PRODUCTO_DISPLAY_MESA.get(prod, prod).upper()
+    calor = info.get("calor")
+    banda = info.get("banda", "SIN HISTORIA")
+    color, bg = _mesa_banda_style(banda)
+    es_sbs = (prod == "SBS")
+    opacidad = "0.65" if es_sbs else "1.0"
+
+    hero = f"{calor:.0f}" if calor is not None else "—"
+    emoji = mesa_calor.BANDA_EMOJI.get(banda, "")
+    chip_txt = f"{emoji} {banda}".strip()
+
+    # Dirección.
+    direccion = info.get("direccion", "SIN DATO")
+    dir_color = MESA_DIR_COLORS.get(direccion, p["text_muted"])
+    dir_glifo = mesa_calor.DIRECCION_GLIFO.get(direccion, "")
+    dir_label = mesa_calor.DIRECCION_LABEL.get(direccion, direccion)
+    delta_gap = info.get("delta_gap")
+    signo_g = "+" if (delta_gap or 0) >= 0 else ""
+    dir_sub = (f"Δgap {signo_g}{fmt_tons(delta_gap)}/10d"
+               if delta_gap is not None else "")
+
+    # Delta índice vs ayer (térmico).
+    dc = info.get("delta_calor")
+    if dc is None:
+        delta_html = "<span class='mesa-sub'>Δ vs ayer n/d</span>"
+    else:
+        if dc > 1:
+            dcol = MESA_HEAT_COLORS["CALIENTE"]["color"]
+        elif dc < -1:
+            dcol = MESA_HEAT_COLORS["MUY PESADO"]["color"]
+        else:
+            dcol = p["text_muted"]
+        delta_html = (f"<span style='font-size:10px; color:{dcol};'>"
+                      f"Δ {dc:+.0f} vs ayer</span>")
+
+    # Sparkline.
+    spark = info.get("spark") or []
+    spark_svg = mesa_calor.sparkline_svg(spark, color_linea=p["accent_blue"],
+                                         color_punto=color)
+
+    # Acción.
+    if es_sbs:
+        accion_html = (f"<div class='mesa-sub' style='margin-top:6px;'>"
+                       f"INFORMATIVO · POROTO EXPORT</div>")
+    else:
+        accion, expl = mesa_calor.accion_sugerida(banda, direccion)
+        accion_html = (
+            f"<div class='mesa-sep'></div>"
+            f"<div class='mesa-accion'>"
+            f"<span style='color:{p['accent']};'>►</span> {accion}</div>"
+            f"<div class='mesa-sub'>{expl}</div>"
+        )
+
+    # Pie: componentes.
+    def _pc(v):
+        return f"p{v:.0f}" if v is not None else "s/h"
+    foot = (f"GAP {_pc(info.get('pctl_gap'))} · "
+            f"LINEUP {_pc(info.get('pctl_lineup'))} · "
+            f"FARMER {_pc(info.get('pctl_farmer'))}")
+
+    return (
+        f"<div class='mesa-card' style='opacity:{opacidad}; "
+        f"border-top:2px solid {color};'>"
+        f"<div class='mesa-spark'>{spark_svg}</div>"
+        f"<div class='mesa-prod'>{nombre}</div>"
+        f"<div style='display:flex; align-items:center; gap:8px; margin:6px 0;'>"
+        f"<span class='mesa-hero' style='color:{color};'>{hero}</span>"
+        f"<span class='mesa-chip' style='color:{color}; background:{bg}; "
+        f"border-color:{color};'>{chip_txt}</span></div>"
+        f"<div class='mesa-dir' style='color:{dir_color};'>{dir_glifo} {dir_label} "
+        f"<span class='mesa-sub'>{dir_sub}</span></div>"
+        f"<div style='margin-top:2px;'>{delta_html}</div>"
+        f"{accion_html}"
+        f"<div class='mesa-foot'>{foot}</div>"
+        f"</div>"
+    )
+
+
+def _mesa_bullet(pctl, color) -> str:
+    """Bullet bar HTML de un percentil 0-100."""
+    if pctl is None:
+        return ("<div class='mesa-bullet-track'></div>"
+                "<span class='mesa-sub'>s/hist</span>")
+    w = max(0, min(100, pctl))
+    return (f"<div class='mesa-bullet-track'>"
+            f"<div class='mesa-bullet-fill' style='width:{w:.0f}%; "
+            f"background:{color};'></div></div>")
+
+
+@st.fragment
+def _render_mesa_tab(fecha_ref: date) -> None:
+    st.markdown(_mesa_css(), unsafe_allow_html=True)
+
+    estado = cached_mesa_estado(fecha_ref)
+    snap_hoy = estado.get("snap_hoy")
+    snap_ayer = estado.get("snap_ayer")
+    productos = estado.get("productos", {})
+
+    # --- Encabezado ---
+    st.markdown("## MESA · CALOR DE MERCADERÍA")
+    if snap_hoy is None:
+        st.info("Sin snapshots de line-up disponibles para esta fecha.")
+        return
+    if snap_ayer is None:
+        sub = (f"SNAPSHOT {snap_hoy} · SIN SNAPSHOT PREVIO — DELTAS NO "
+               f"DISPONIBLES · ROJO=CALOR · CIAN=FRÍO")
+    else:
+        sub = (f"SNAPSHOT {snap_hoy} · VS HÁBIL ANTERIOR {snap_ayer} · "
+               f"ROJO=CALOR · CIAN=FRÍO")
+    st.caption(sub)
+
+    # --- Sección 1: Qué cambió desde ayer (tape) ---
+    st.markdown("##### QUÉ CAMBIÓ DESDE AYER")
+    if snap_ayer is not None:
+        master = cached_master_exports(cached_ultima_fecha() or fecha_ref)
+        lineup_hoy = _snapshot_lineup(master, snap_hoy)
+        lineup_ayer = _snapshot_lineup(master, snap_ayer)
+        djve_hist = cached_djve_multianio((fecha_ref.year, fecha_ref.year - 1))
+        eventos = mesa_diff.construir_diff(
+            {k: {"banda": v["banda"], "direccion": v["direccion"],
+                 "calor": v["calor"], "gap_tn": v["gap_tn"]}
+             for k, v in productos.items()},
+            estado.get("estado_ayer", {}),
+            lineup_hoy, lineup_ayer, _djve_asof(djve_hist, snap_hoy),
+            snap_ayer, max_eventos=8,
+        )
+        st.markdown(_mesa_tape_html(eventos, snap_ayer), unsafe_allow_html=True)
+    else:
+        st.markdown(_mesa_tape_html([], snap_ayer), unsafe_allow_html=True)
+
+    st.divider()
+
+    # --- Sección 2: Semáforo por producto (cards) ---
+    st.markdown("##### SEMÁFORO POR PRODUCTO")
+    cols = st.columns(4)
+    for col, prod in zip(cols, _MESA_PRODUCTOS):
+        info = productos.get(prod, {})
+        with col:
+            st.markdown(_mesa_card_html(prod, info), unsafe_allow_html=True)
+
+    st.divider()
+
+    # --- Sección 3: Matriz producto × mes de embarque ---
+    st.markdown("##### PRESIÓN POR MES DE EMBARQUE · POSICIONES A3")
+    _render_mesa_embarque(fecha_ref)
+
+    st.divider()
+
+    # --- Sección 4: Zonas portuarias ---
+    st.markdown("##### ZONAS PORTUARIAS · TONELAJE 30D VS HISTORIA ESTACIONAL")
+    _render_mesa_zonas(fecha_ref, snap_hoy)
+
+    st.divider()
+
+    # --- Sección 5: Top exportadores cortos ---
+    st.markdown("##### TOP EXPORTADORES CORTOS · 7D")
+    _render_mesa_cortos(fecha_ref)
+
+    st.divider()
+
+    # --- Sección 6: Metodología ---
+    _render_mesa_metodologia()
+
+
+def _render_mesa_embarque(fecha_ref: date) -> None:
+    """Heatmap producto × mes de embarque con bandas discretas."""
+    data = cached_mesa_embarque(fecha_ref)
+    meses = data.get("meses", [])
+    filas = data.get("filas", {})
+    if not meses or not filas:
+        st.caption("SIN DATOS DE EMBARQUE PARA ESTA FECHA.")
+        return
+
+    productos = ["MAIZE", "SOJA_CRUSH", "WHEAT"]
+    y_labels = [mesa_calor.PRODUCTO_DISPLAY_MESA[p].upper() for p in productos]
+    x_labels = []
+    for anio, mes in meses:
+        et = _MES_ABBR[mes]
+        if mes in (1, 2) or (anio != fecha_ref.year):
+            et = f"{et} {str(anio)[-2:]}"
+        x_labels.append(et)
+
+    # z = índice de banda 0-4 (para color discreto); text = percentil + n buques.
+    banda_idx = {"MUY PESADO": 0, "PESADO": 1, "NEUTRO": 2, "FIRME": 3, "CALIENTE": 4}
+    z, text, custom = [], [], []
+    for prod in productos:
+        zrow, trow, crow = [], [], []
+        celdas = {(c["anio"], c["mes"]): c for c in filas.get(prod, [])}
+        for anio, mes in meses:
+            c = celdas.get((anio, mes))
+            if c is None or c["pctl"] is None:
+                zrow.append(None)
+                trow.append("—")
+                crow.append("sin dato")
+            else:
+                banda = mesa_calor.clasificar_banda(c["pctl"])
+                zrow.append(banda_idx.get(banda, 2))
+                trow.append(f"{c['pctl']:.0f}<br>({c['n_buques']} bq)")
+                crow.append(
+                    f"gap {fmt_tons(c['gap_tn'])} · DJVE {fmt_tons(c['declarado_tn'])}"
+                    f" − lineup {fmt_tons(c['originado_tn'])}"
+                )
+        z.append(zrow)
+        text.append(trow)
+        custom.append(crow)
+
+    # Colorscale escalonada con los fondos de banda (alpha bajo).
+    cols_banda = [
+        MESA_HEAT_COLORS["MUY PESADO"]["color"],
+        MESA_HEAT_COLORS["PESADO"]["color"],
+        MESA_HEAT_COLORS["NEUTRO"]["color"],
+        MESA_HEAT_COLORS["FIRME"]["color"],
+        MESA_HEAT_COLORS["CALIENTE"]["color"],
+    ]
+    colorscale = []
+    for i, c in enumerate(cols_banda):
+        lo, hi = i / 5.0, (i + 1) / 5.0
+        colorscale.append([lo, c])
+        colorscale.append([hi, c])
+
+    fig = go.Figure(go.Heatmap(
+        z=z, x=x_labels, y=y_labels, text=text, customdata=custom,
+        texttemplate="%{text}", textfont={"size": 11},
+        colorscale=colorscale, zmin=0, zmax=4, showscale=False,
+        xgap=2, ygap=2,
+        hovertemplate="%{y} · %{x}<br>%{customdata}<extra></extra>",
+    ))
+    fig.update_layout(height=max(200, 46 * len(productos) + 70),
+                      margin=dict(l=10, r=10, t=10, b=10))
+    aplicar_tema(fig)
+    fig.update_xaxes(side="top", showgrid=False)
+    fig.update_yaxes(showgrid=False, autorange="reversed")
+    st.plotly_chart(fig, use_container_width=True, key="mesa_embarque_hm")
+
+    # Leyenda manual de chips + caption.
+    chips = []
+    for banda, rng in [("CALIENTE", "≥80"), ("FIRME", "60-80"),
+                       ("NEUTRO", "40-60"), ("PESADO", "20-40"),
+                       ("MUY PESADO", "<20")]:
+        c, _ = _mesa_banda_style(banda)
+        chips.append(f"<span style='color:{c};'>■</span> {rng} {banda}")
+    st.markdown(
+        f"<div class='mesa-sub'>{' &nbsp; '.join(chips)}</div>",
+        unsafe_allow_html=True)
+    st.caption("MESES LEJANOS: LINE-UP INCOMPLETO POR NATURALEZA — LEER N_BUQUES")
+
+
+def _render_mesa_zonas(fecha_ref: date, snap_hoy: date) -> None:
+    """3 cards de zona con bullet bars de percentil y buques ≤7d."""
+    master = cached_master_exports(cached_ultima_fecha() or fecha_ref)
+    lineup_hoy = _snapshot_lineup(master, snap_hoy)
+    snapshots = _fechas_snapshot_disponibles(master)
+
+    zonas = {
+        "UP-RIVER ROSARIO": ("Gran Rosario Norte", "Gran Rosario Sur"),
+        "BAHÍA BLANCA": ("Bahia Blanca",),
+        "QUEQUÉN": ("Necochea/Quequen",),
+    }
+    productos = ["MAIZE", "WHEAT", "SOJA_CRUSH"]
+    cols = st.columns(3)
+
+    if not lineup_hoy.empty:
+        lineup_hoy = lineup_hoy.copy()
+        lineup_hoy["_zona"] = lineup_hoy["port"].map(zona_de_puerto)
+
+    for col, (zona_label, zona_keys) in zip(cols, zonas.items()):
+        with col:
+            html = _mesa_zona_card(
+                zona_label, zona_keys, productos, lineup_hoy,
+                master, snapshots, fecha_ref, snap_hoy)
+            st.markdown(html, unsafe_allow_html=True)
+
+    st.caption(
+        "DJVE ES NACIONAL (SIN PUERTO): ESTA VISTA ES SOLO LADO LINE-UP — "
+        "NO HAY GAP DE COBERTURA ZONAL.")
+
+
+def _mesa_zona_card(zona_label, zona_keys, productos, lineup_hoy,
+                    master, snapshots, fecha_ref, snap_hoy) -> str:
+    p = BLOOMBERG_PALETTE
+    if lineup_hoy is None or lineup_hoy.empty:
+        sub = lineup_hoy
+    else:
+        sub = lineup_hoy[lineup_hoy["_zona"].isin(zona_keys)]
+
+    # Bullet bars de percentil por producto (tonelaje 30d vs historia).
+    filas = []
+    for prod in productos:
+        codigos = list(mesa_calor.CODIGOS_CRUSH) if prod == "SOJA_CRUSH" else [prod]
+        ton_hoy = _tonelaje_zona(sub, codigos, snap_hoy)
+        pctl = _pctl_tonelaje_zona(master, zona_keys, codigos, prod,
+                                   fecha_ref, snapshots)
+        banda = mesa_calor.clasificar_banda(pctl)
+        color, _ = _mesa_banda_style(banda)
+        emoji = mesa_calor.BANDA_EMOJI.get(banda, "")
+        pctl_s = f"p{pctl:.0f} {emoji}".strip() if pctl is not None else "s/hist"
+        nombre = mesa_calor.PRODUCTO_DISPLAY_MESA[prod]
+        filas.append(
+            f"<div style='display:flex; align-items:center; gap:6px; margin:4px 0;'>"
+            f"<span class='mesa-sub' style='width:64px;'>{nombre.upper()}</span>"
+            f"<span style='flex:1;'>{_mesa_bullet(pctl, color)}</span>"
+            f"<span class='mesa-sub' style='width:54px; text-align:right;'>{pctl_s}</span>"
+            f"</div>"
+        )
+
+    # Buques ≤7d.
+    buq_html = ["<div class='mesa-sep'></div>",
+                "<div class='mesa-sub'>PRÓXIMOS ≤7D</div>"]
+    if sub is not None and not sub.empty:
+        s2 = sub.copy()
+        etb = pd.to_datetime(s2["etb"], errors="coerce").dt.date
+        s2 = s2[etb.notna() & (etb >= snap_hoy)
+                & (etb <= snap_hoy + timedelta(days=7))]
+        s2["quantity"] = pd.to_numeric(s2["quantity"], errors="coerce").fillna(0)
+        s2 = s2.sort_values("etb")
+        for i, (_, r) in enumerate(s2.iterrows()):
+            if i >= 4:
+                resto = s2.iloc[4:]
+                buq_html.append(
+                    f"<div class='mesa-sub'>+{len(resto)} buques más · "
+                    f"{fmt_tons(resto['quantity'].sum())}</div>")
+                break
+            shp = r.get("shipper_canon") or "OTROS"
+            shp_color = SHIPPER_COLORS.get(shp, SHIPPER_COLORS["OTROS"])
+            etb_d = pd.to_datetime(r["etb"]).date()
+            dd = (etb_d - snap_hoy).days
+            buq_html.append(
+                f"<div style='font-size:10px;'>ETB+{dd}d "
+                f"<span style='color:{shp_color}; font-weight:700;'>{shp}</span> "
+                f"{r.get('cargo','')} {fmt_tons(r['quantity'])}</div>")
+    else:
+        buq_html.append("<div class='mesa-sub'>sin buques</div>")
+
+    return (
+        f"<div class='mesa-card' style='min-height:220px;'>"
+        f"<div class='mesa-prod'>{zona_label}</div>"
+        f"<div style='margin-top:8px;'>{''.join(filas)}</div>"
+        f"{''.join(buq_html)}"
+        f"</div>"
+    )
+
+
+def _tonelaje_zona(sub, codigos, snap_hoy) -> float:
+    if sub is None or sub.empty:
+        return 0.0
+    return mesa_calor.tonelaje_lineup(
+        sub.rename(columns={}), snap_hoy,
+        "SOJA_CRUSH" if set(codigos) == set(mesa_calor.CODIGOS_CRUSH) else codigos[0])
+
+
+def _pctl_tonelaje_zona(master, zona_keys, codigos, prod, fecha_ref,
+                        snapshots) -> float | None:
+    """Percentil estacional del tonelaje zonal (solo line-up)."""
+    cod_camp = "SBM" if prod == "SOJA_CRUSH" else prod
+    ventanas = estacional.fechas_estacionales(cod_camp, fecha_ref)
+    if not ventanas:
+        return None
+    snap_hoy = max((s for s in snapshots if s <= fecha_ref), default=None)
+    if snap_hoy is None:
+        return None
+    lineup_hoy = _snapshot_lineup(master, snap_hoy)
+    if not lineup_hoy.empty:
+        lineup_hoy = lineup_hoy.copy()
+        lineup_hoy["_zona"] = lineup_hoy["port"].map(zona_de_puerto)
+        lineup_hoy = lineup_hoy[lineup_hoy["_zona"].isin(zona_keys)]
+    ton_hoy = _tonelaje_zona(lineup_hoy, codigos, snap_hoy)
+
+    registros = []
+    for _camp, desde, hasta in ventanas:
+        for snap in snapshots:
+            if snap < desde or snap > hasta:
+                continue
+            ld = _snapshot_lineup(master, snap)
+            if ld.empty:
+                continue
+            ld = ld.copy()
+            ld["_zona"] = ld["port"].map(zona_de_puerto)
+            ld = ld[ld["_zona"].isin(zona_keys)]
+            registros.append((snap, prod, _tonelaje_zona(ld, codigos, snap)))
+    serie = estacional.construir_serie(registros)
+    return estacional.percentil_estacional(serie, prod, fecha_ref, ton_hoy)
+
+
+def _render_mesa_cortos(fecha_ref: date) -> None:
+    """Tabla de top exportadores cortos (reuso de COMPRADORES FAS)."""
+    resultados = cached_fas_urgencia(fecha_ref)
+    perfiles = cached_fas_perfiles(fecha_ref)
+    tabla = fas_comprador.tabla_urgencia(resultados, perfiles)
+    if tabla.empty:
+        st.caption("SIN EXPORTADORES CORTOS PARA ESTA FECHA.")
+        return
+
+    tabla = tabla[tabla["falta_7d"] > 0].head(8).copy()
+    if tabla.empty:
+        st.caption("NINGÚN EXPORTADOR CON POSICIÓN CORTA EN 7D.")
+        return
+
+    vista = pd.DataFrame({
+        "EXPORTADOR": tabla["shipper_canon"],
+        "PROD": tabla["producto_display"],
+        "FALTA 7D": tabla["falta_7d"],
+        "FALTA 30D": tabla["falta_30d"],
+        "ETB(D)": tabla["dias_proximo_etb"],
+        "SCORE": tabla["urgencia_score_7d"].round(1),
+    })
+
+    max_falta = float(vista["FALTA 7D"].max() or 1)
+    st.dataframe(
+        vista, hide_index=True, use_container_width=True, height=300,
+        column_config={
+            "FALTA 7D": st.column_config.ProgressColumn(
+                "FALTA 7D", format="%.0f tn", min_value=0, max_value=max_falta),
+            "FALTA 30D": st.column_config.NumberColumn("FALTA 30D", format="%.0f"),
+            "SCORE": st.column_config.NumberColumn("SCORE", format="%.1f"),
+        },
+    )
+    st.caption(
+        "EXPORTADOR CORTO CON GAP CRECIENDO = POSIBLE TOMA A FIJAR "
+        "(VENTANA CARRY A) · DETALLE COMPLETO EN PESTAÑA COMPRADORES FAS")
+
+
+def _render_mesa_metodologia() -> None:
+    """Expander con fórmula, parametría vigente y limitaciones."""
+    with st.expander("ⓘ METODOLOGÍA · PESOS VIGENTES · LIMITACIONES"):
+        st.markdown(
+            "**Índice de calor** (0-100), demanda dominante:\n\n"
+            "```\n"
+            "CALOR = w_gap·pctl(gap) + w_lineup·pctl(lineup) "
+            "+ w_farmer·(100−pctl(avance ventas))\n"
+            "```\n"
+            "Percentiles **estacionales**: el valor de hoy vs la misma época "
+            "de las últimas campañas (no umbrales absolutos)."
+        )
+        params = pd.DataFrame({
+            "Parámetro": ["w_gap", "w_lineup", "w_farmer", "Horizonte (días)",
+                          "K momentum (días)", "Umbral dirección (tn)",
+                          "Ventana estacional (±días)", "Campañas historia",
+                          "Rinde harina", "Rinde aceite"],
+            "Vigente": [mesa_calor.W_GAP, mesa_calor.W_LINEUP, mesa_calor.W_FARMER,
+                        mesa_calor.HORIZONTE_CALOR_DIAS, mesa_calor.K_MOMENTUM_DIAS,
+                        mesa_calor.UMBRAL_DIRECCION_TN,
+                        estacional.VENTANA_ESTACIONAL_DIAS,
+                        estacional.CAMPANAS_HISTORIA,
+                        mesa_calor.RINDE_HARINA, mesa_calor.RINDE_ACEITE],
+        })
+        st.dataframe(params, hide_index=True, use_container_width=True)
+        st.markdown(
+            "**Convención de color (térmica, no P&L):** rojo = calor / demanda "
+            "urgente · cian = frío / cubiertos. Bandas: 🔥 CALIENTE ≥80 · "
+            "FIRME 60-80 · NEUTRO 40-60 · PESADO 20-40 · 🧊 MUY PESADO <20.\n\n"
+            "**Limitaciones:**\n"
+            "1. **DJVE anticipadas**: se puede declarar antes de comprar "
+            "(estrategia fiscal). Un gap enorme puede no ser urgencia física.\n"
+            "2. **DJVE sin puerto**: la vista zonal es solo line-up.\n"
+            "3. **Compras MAGyP semanales y con rezago**: el farmer selling se "
+            "mueve más lento que el line-up.\n"
+            "4. **Sin precios por diseño**: el índice dice dónde hay presión "
+            "física; si ya está pagada lo dice el Excel de la mesa.\n"
+            "5. **Meses lejanos con line-up incompleto**: la celda describe más "
+            "DJVE que line-up — leer n_buques."
+        )
 
 
 # ==========================================================================
@@ -1378,7 +2310,8 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
             fig_py = px.bar(
                 agg_py, x="tons", y="shipper_canon",
                 color="origen_alt", orientation="h",
-                color_discrete_map={"PY": "#FF3333", "UY": "#33AAFF"},
+                color_discrete_map={"PY": BLOOMBERG_PALETTE["warning"],
+                                    "UY": "#33AAFF"},
                 labels={"tons": "Toneladas", "shipper_canon": "", "origen_alt": "Filial"},
             )
             aplicar_tema(fig_py)
@@ -1563,6 +2496,9 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
 # Se hace aca para que la definicion de las funciones quede arriba en el
 # archivo y la ejecucion de los tabs siga el orden visual del usuario.
 # ==========================================================================
+
+with tab_mesa:
+    _render_mesa_tab(fecha_ref)
 
 with tab_pan:
     _render_panorama_tab(fecha_ref, ventana_dias)
@@ -2294,10 +3230,9 @@ def _render_congestion_tab(fecha_ref):
                         <div style='
                             background:{BLOOMBERG_PALETTE["bg_card"]};
                             border:1px solid {color_borde};
-                            border-radius:4px;
+                            border-radius:2px;
                             padding:8px 6px;
                             text-align:center;
-                            font-family:Consolas,monospace;
                             min-height:140px;
                         '>
                             <div style='font-size:11px; color:{BLOOMBERG_PALETTE["text_muted"]};'>
@@ -2329,9 +3264,9 @@ with tab_cng:
 # ===========================================================================
 
 _SEÑAL_COLOR = {
-    "ROJO": "#FF4444",
-    "AMBAR": "#FFB300",
-    "VERDE": "#4CAF50",
+    "ROJO": BLOOMBERG_PALETTE["negative"],
+    "AMBAR": BLOOMBERG_PALETTE["warning"],
+    "VERDE": BLOOMBERG_PALETTE["positive"],
 }
 _SEÑAL_EMOJI = {"ROJO": "🔴", "AMBAR": "🟡", "VERDE": "🟢"}
 

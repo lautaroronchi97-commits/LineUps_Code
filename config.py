@@ -127,6 +127,33 @@ SHIPPER_COLORS: dict[str, str] = {
     "OTROS":         "#808080",  # gris neutro
 }
 
+# ---------------------------------------------------------------------------
+# Pestaña MESA: escala TÉRMICA de calor (no escala P&L)
+# ---------------------------------------------------------------------------
+# El índice de calor mide TEMPERATURA de la demanda física, no ganancia/pérdida.
+# Rojo = calor (demanda urgente), cian = frío (cubiertos). El verde NO se usa
+# en MESA: ninguna banda es "buena" o "mala" en sí — son condiciones de mercado.
+# Cada banda trae color de texto/borde y color de fondo del chip (alpha bajo).
+
+MESA_HEAT_COLORS: dict[str, dict[str, str]] = {
+    "CALIENTE":   {"color": "#ff3333", "bg": "rgba(255,51,51,0.12)"},   # ≥80
+    "FIRME":      {"color": "#e06010", "bg": "rgba(224,96,16,0.12)"},   # 60-80
+    "NEUTRO":     {"color": "#8a8a99", "bg": "rgba(138,138,153,0.10)"}, # 40-60
+    "PESADO":     {"color": "#6655ee", "bg": "rgba(102,85,238,0.12)"},  # 20-40
+    "MUY PESADO": {"color": "#00d4ff", "bg": "rgba(0,212,255,0.12)"},   # <20
+    "SIN HISTORIA": {"color": "#50505f", "bg": "rgba(80,80,95,0.08)"},
+}
+
+# Dirección del gap: misma lógica térmica (la flecha dice hacia dónde va la
+# temperatura). Abriéndose = se calienta (rojo); cerrándose = se enfría (cian).
+MESA_DIR_COLORS: dict[str, str] = {
+    "ABRIENDOSE": "#ff3333",
+    "ESTABLE":    "#8a8a99",
+    "CERRANDOSE": "#00d4ff",
+    "SIN DATO":   "#50505f",
+}
+
+
 # Paleta Bloomberg (para elementos generales del dashboard).
 BLOOMBERG_PALETTE = {
     "bg_primary":   "#08080f",   # fondo principal (casi negro, leve tinte azul)
