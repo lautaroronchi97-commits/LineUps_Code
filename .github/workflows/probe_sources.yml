@@ -1,15 +1,15 @@
 name: Probe fuentes de datos (diagnostico)
 
-# Workflow de diagnostico TEMPORAL. No escribe nada: solo le pega a varios
-# endpoints candidatos de farmer-selling / comercializacion de granos DESDE EL
-# RUNNER REAL de GitHub Actions y reporta el codigo HTTP de cada uno.
+# Workflow de diagnostico TEMPORAL. No escribe nada.
 #
-# Objetivo: saber empiricamente que host es accesible desde la automatizacion
-# (vs el 403 conocido de datos.magyp.gob.ar). El portal nacional (datos.gob.ar,
-# apis.datos.gob.ar, infra.datos.gob.ar) espeja la misma data del MAGyP pero
-# corre en otra infraestructura; este probe confirma si responde 200.
+# Fase 1 (ya corrida): confirmamos que infra.datos.gob.ar y apis.datos.gob.ar
+# responden 200 desde el runner (vs el 403/404 de datos.magyp.gob.ar).
 #
-# Una vez que sepamos que fuente anda, se borra este archivo.
+# Fase 2 (este step): bajar el catalogo agroindustria del portal nacional y
+# encontrar la URL exacta del dataset de compras/comercializacion de granos,
+# que es lo que alimenta el componente farmer-selling de MESA.
+#
+# Se borra cuando tengamos la URL.
 on:
   workflow_dispatch:
 
@@ -17,71 +17,37 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  discover:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Probar accesibilidad de fuentes candidatas
+      - name: Descubrir dataset de compras en el catalogo nacional
         run: |
-          set +e
-          probe() {
-            local nombre="$1"; local url="$2"
-            local out; out=$(curl -s -m 25 \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36" \
-              -w "\n__HTTP__%{http_code}__CT__%{content_type}__SZ__%{size_download}" \
-              "$url")
-            local meta="${out##*__HTTP__}"
-            local code="${meta%%__CT__*}"
-            local rest="${meta#*__CT__}"
-            local ct="${rest%%__SZ__*}"
-            local sz="${rest##*__SZ__}"
-            local body="${out%__HTTP__*}"
-            local head120; head120=$(printf '%s' "$body" | tr '\n' ' ' | cut -c1-120)
-            echo "=================================================================="
-            echo "FUENTE : $nombre"
-            echo "URL    : $url"
-            echo "HTTP   : $code   | content-type: $ct | bytes: $sz"
-            echo "INICIO : $head120"
-          }
+          set -e
+          echo "### Bajando catalogo agroindustria (infra.datos.gob.ar)..."
+          curl -s -m 40 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "https://infra.datos.gob.ar/catalog/agroindustria/data.json" -o cat.json
+          echo "Bytes bajados: $(wc -c < cat.json)"
 
-          echo "### Runner IP publica (para contexto):"
-          curl -s -m 15 https://api.ipify.org; echo ""
-
-          # 0. Baseline: CKAN del MAGyP (403 esperado desde cloud).
-          probe "MAGyP CKAN package_show (baseline)" \
-            "https://datos.magyp.gob.ar/api/3/action/package_show?id=compras-de-granos"
-
-          # 1. CKAN nacional (otra infra, espeja MAGyP).
-          probe "datos.gob.ar CKAN package_search compras" \
-            "https://datos.gob.ar/api/3/action/package_search?q=compras%20de%20granos&rows=3"
-
-          # 2. API de Series de Tiempo nacional - search.
-          probe "apis.datos.gob.ar Series search comercializacion" \
-            "https://apis.datos.gob.ar/series/api/search/?q=comercializacion&limit=3"
-
-          # 3. API de Series de Tiempo nacional - datos reales (serie ejemplo).
-          probe "apis.datos.gob.ar Series get (serie ejemplo)" \
-            "https://apis.datos.gob.ar/series/api/series/?ids=101.1_I2NG_2016_M_22&limit=2&format=json"
-
-          # 4. Mismo Series API pero via host datos.gob.ar.
-          probe "datos.gob.ar Series get (serie ejemplo)" \
-            "https://datos.gob.ar/series/api/series/?ids=101.1_I2NG_2016_M_22&limit=2&format=json"
-
-          # 5. Storage del portal nacional (donde viven los CSV/XLSX).
-          probe "infra.datos.gob.ar (storage nacional, raiz)" \
-            "https://infra.datos.gob.ar/catalog/agroindustria/data.json"
-
-          # 6. Subdominio de estimaciones del MAGyP.
-          probe "datosestimaciones.magyp.gob.ar (raiz)" \
-            "https://datosestimaciones.magyp.gob.ar/"
-
-          # 7. Bolsa de Cereales (PAS - panorama agricola semanal).
-          probe "Bolsa de Cereales (raiz)" \
-            "https://www.bolsadecereales.com/"
-
-          # 8. BCR - Bolsa de Comercio de Rosario.
-          probe "BCR Rosario (raiz)" \
-            "https://www.bcr.com.ar/"
-
-          echo "=================================================================="
-          echo "Probe terminado. Revisar los codigos HTTP arriba (200 = accesible)."
+          python3 - <<'PY'
+          import json
+          cat = json.load(open('cat.json'))
+          ds = cat.get('dataset', [])
+          print("Total datasets en el catalogo:", len(ds))
+          kw = ('compra', 'comercial', 'djve', 'venta declarada', 'declaracion')
+          encontrados = 0
+          for d in ds:
+              blob = (str(d.get('title','')) + ' ' + str(d.get('description',''))).lower()
+              if any(k in blob for k in kw):
+                  encontrados += 1
+                  print("=" * 70)
+                  print("TITLE  :", d.get('title'))
+                  print("IDENT  :", d.get('identifier'))
+                  print("THEMES :", d.get('theme'))
+                  for dist in d.get('distribution', []):
+                      print("   DIST [%s] %s" % (dist.get('format'), dist.get('title')))
+                      print("        URL: %s" % dist.get('downloadURL'))
+          print("=" * 70)
+          print("Datasets que matchean compras/comercializacion:", encontrados)
+          PY
