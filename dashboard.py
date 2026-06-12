@@ -87,6 +87,7 @@ from db import (
     ultima_fecha_cargada,
 )
 from shipper_norm import SHIPPERS_TOP, aplicar_a_dataframe
+import fas_comprador
 
 # ===========================================================================
 # Configuracion general de la pagina
@@ -512,6 +513,37 @@ def cached_djve(anio: int) -> pd.DataFrame:
     return query_djve(anio=anio)
 
 
+@st.cache_data(ttl=900)
+def cached_fas_urgencia(fecha_ref: date, horizontes: tuple[int, ...] = (7, 15, 30)) -> dict[int, "pd.DataFrame"]:
+    """Urgencia compradora por shipper para la pestaña COMPRADORES FAS."""
+    df_lineup = cached_master_exports(cached_ultima_fecha() or fecha_ref)
+    df_djve = cached_djve(fecha_ref.year)
+    return fas_comprador.urgencia_por_shipper(
+        df_djve, df_lineup, fecha_ref, list(horizontes)
+    )
+
+
+@st.cache_data(ttl=3600)
+def cached_fas_perfiles(fecha_ref: date) -> dict[tuple[str, str], dict]:
+    """Perfil histórico por (shipper_canon, codigo_interno) para los últimos 90 días."""
+    df_lineup_hist = cached_master_exports(cached_ultima_fecha() or fecha_ref)
+    df_djve_hist = cached_djve(fecha_ref.year)
+    # Extraer pares únicos del lineup de los últimos 90 días.
+    from datetime import timedelta
+    inicio_hist = fecha_ref - timedelta(days=90)
+    pares = set()
+    for _, row in df_lineup_hist[df_lineup_hist["cargo"].isin(fas_comprador.PRODUCTOS_FAS)].iterrows():
+        pares.add((row.get("shipper_canon", ""), row.get("cargo", "")))
+    perfiles: dict[tuple[str, str], dict] = {}
+    for shipper_canon, codigo_interno in pares:
+        if not shipper_canon or not codigo_interno:
+            continue
+        perfiles[(shipper_canon, codigo_interno)] = fas_comprador.perfil_historico(
+            df_lineup_hist, shipper_canon, codigo_interno, df_djve_hist, fecha_ref
+        )
+    return perfiles
+
+
 @st.cache_data(ttl=86400, show_spinner="Descargando estimaciones MAGyP...")
 def cached_estimaciones() -> pd.DataFrame:
     """
@@ -893,11 +925,12 @@ _render_senales_hoy()
 # Pestanas
 # ===========================================================================
 
-tab_pan, tab_shp, tab_prd, tab_cng = st.tabs([
+tab_pan, tab_shp, tab_prd, tab_cng, tab_fas = st.tabs([
     "📊 PANORAMA",
     "🏢 SHIPPERS",
     "🌾 PRODUCTOS",
     "⚓ CONGESTION",
+    "🎯 COMPRADORES FAS",
 ])
 
 
@@ -2289,6 +2322,200 @@ def _render_congestion_tab(fecha_ref):
 
 with tab_cng:
     _render_congestion_tab(fecha_ref)
+
+
+# ===========================================================================
+# Pestaña 5: COMPRADORES FAS
+# ===========================================================================
+
+_SEÑAL_COLOR = {
+    "ROJO": "#FF4444",
+    "AMBAR": "#FFB300",
+    "VERDE": "#4CAF50",
+}
+_SEÑAL_EMOJI = {"ROJO": "🔴", "AMBAR": "🟡", "VERDE": "🟢"}
+
+_GRUPO_PRODUCTOS = {
+    "Todos": None,
+    "Soja": {"SBS", "SBM", "SBO"},
+    "Maíz": {"MAIZE"},
+    "Trigo": {"WHEAT"},
+}
+
+
+@st.fragment
+def _render_fas_comprador_tab(fecha_ref: date) -> None:
+    st.markdown("### 🎯 Urgencia compradora por exportador")
+    st.caption(
+        "Exportadores con barcos comprometidos (ETB próximo) y posición corta en DJVE. "
+        "Mayor score = más presión compradora = mejor precio para el vendedor FAS."
+    )
+
+    col_grp, col_hz = st.columns([2, 3])
+    with col_grp:
+        grupo_sel = st.selectbox(
+            "Filtrar por producto",
+            list(_GRUPO_PRODUCTOS.keys()),
+            key="fas_grupo",
+        )
+    productos_filtro = _GRUPO_PRODUCTOS[grupo_sel]
+
+    # Datos
+    with st.spinner("Calculando urgencia compradora..."):
+        resultados = cached_fas_urgencia(fecha_ref)
+        perfiles = cached_fas_perfiles(fecha_ref)
+
+    tabla = fas_comprador.tabla_urgencia(resultados, perfiles)
+
+    # Aplicar filtro de producto
+    if productos_filtro and not tabla.empty:
+        tabla = tabla[tabla["codigo_interno"].isin(productos_filtro)]
+
+    # --- KPIs ---
+    df_7 = resultados.get(7, pd.DataFrame())
+    if productos_filtro and not df_7.empty:
+        df_7 = df_7[df_7["codigo_interno"].isin(productos_filtro)]
+
+    k1, k2, k3 = st.columns(3)
+    if not df_7.empty and df_7["urgencia_score"].max() > 0:
+        top = df_7.iloc[0]
+        k1.metric(
+            "Exportador más urgente (7d)",
+            top["shipper_canon"],
+            f"{top['producto_display']} · score {top['urgencia_score']:.1f}",
+        )
+        total_exp = int(df_7[df_7["falta_cubrir_tn"] > 0]["falta_cubrir_tn"].sum())
+        k2.metric("Toneladas expuestas (7d)", fmt_tons(total_exp))
+        etb_min = int(df_7[df_7["falta_cubrir_tn"] > 0]["dias_proximo_etb"].min())
+        k3.metric("Días al ETB crítico", f"{etb_min}d", delta_color="inverse")
+    else:
+        k1.metric("Exportador más urgente (7d)", "—")
+        k2.metric("Toneladas expuestas (7d)", "—")
+        k3.metric("Días al ETB crítico", "—")
+
+    st.divider()
+
+    # --- Tabla por horizonte ---
+    hz_tabs = st.tabs(["⚡ 7 días", "📅 15 días", "🗓️ 30 días"])
+    for i, (hz, hz_label) in enumerate(zip([7, 15, 30], ["7d", "15d", "30d"])):
+        with hz_tabs[i]:
+            df_hz = resultados.get(hz, pd.DataFrame()).copy()
+            if productos_filtro and not df_hz.empty:
+                df_hz = df_hz[df_hz["codigo_interno"].isin(productos_filtro)]
+
+            if df_hz.empty:
+                st.info("Sin datos de urgencia para este horizonte.")
+                continue
+
+            # Agregar perfil y señal para la tabla de horizonte individual
+            df_hz["perfil"] = df_hz.apply(
+                lambda r: perfiles.get(
+                    (r["shipper_canon"], r["codigo_interno"]), {}
+                ).get("label", "SIN HISTORIA"),
+                axis=1,
+            )
+
+            def _fmt_señal(dias: int) -> str:
+                if dias <= 7:
+                    return "🔴 ROJO"
+                if dias <= 15:
+                    return "🟡 AMBAR"
+                return "🟢 VERDE"
+
+            df_hz["señal"] = df_hz["dias_proximo_etb"].apply(_fmt_señal)
+
+            display = df_hz[[
+                "shipper_canon", "producto_display",
+                "declarado_tn", "falta_cubrir_tn", "ratio_cobertura",
+                "n_buques", "dias_proximo_etb", "urgencia_score", "señal", "perfil",
+            ]].rename(columns={
+                "shipper_canon": "Exportador",
+                "producto_display": "Producto",
+                "declarado_tn": "Declarado (tn)",
+                "falta_cubrir_tn": "Falta cubrir (tn)",
+                "ratio_cobertura": "Cobertura",
+                "n_buques": "Buques",
+                "dias_proximo_etb": "ETB (días)",
+                "urgencia_score": "Score",
+                "señal": "Urgencia",
+                "perfil": "Perfil histórico",
+            })
+
+            for col_tn in ["Declarado (tn)", "Falta cubrir (tn)"]:
+                display[col_tn] = display[col_tn].apply(
+                    lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+                )
+            display["Cobertura"] = display["Cobertura"].apply(
+                lambda v: f"{v:.0%}" if pd.notna(v) else "—"
+            )
+            display["Score"] = display["Score"].apply(lambda v: f"{v:.2f}")
+
+            st.dataframe(
+                display,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            csv = display.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                f"⬇ Descargar CSV ({hz_label})",
+                csv,
+                file_name=f"fas_urgencia_{hz_label}_{fecha_ref}.csv",
+                mime="text/csv",
+                key=f"fas_dl_{hz}",
+            )
+
+    # --- Tabla wide (los 3 horizontes) ---
+    if not tabla.empty:
+        st.divider()
+        st.markdown("#### Resumen — evolución 7d → 15d → 30d")
+        tabla_fmt = tabla.copy()
+        for col in ["falta_7d", "falta_15d", "falta_30d"]:
+            tabla_fmt[col] = tabla_fmt[col].apply(
+                lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+            )
+        tabla_fmt["urgencia_score_7d"] = tabla_fmt["urgencia_score_7d"].apply(
+            lambda v: f"{v:.2f}"
+        )
+        tabla_fmt["señal"] = tabla_fmt["señal"].apply(
+            lambda s: _SEÑAL_EMOJI.get(s, s) + " " + s
+        )
+        st.dataframe(
+            tabla_fmt[[
+                "shipper_canon", "producto_display", "falta_7d", "falta_15d", "falta_30d",
+                "dias_proximo_etb", "urgencia_score_7d", "perfil_label", "señal",
+            ]].rename(columns={
+                "shipper_canon": "Exportador",
+                "producto_display": "Producto",
+                "falta_7d": "Falta 7d (tn)",
+                "falta_15d": "Falta 15d (tn)",
+                "falta_30d": "Falta 30d (tn)",
+                "dias_proximo_etb": "ETB (días)",
+                "urgencia_score_7d": "Score 7d",
+                "perfil_label": "Perfil",
+                "señal": "Urgencia",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # --- Nota metodológica ---
+    with st.expander("ℹ️ Metodología"):
+        st.markdown("""
+**URGENCIA SCORE** = `(falta_cubrir / 65.000 tn) × (1 + factor_etb)`
+
+- **Falta cubrir** = DJVE declaradas (ventana de embarque activa) − buques en line-up.
+- **Factor ETB** ∈ [0, 1]: cuanto más cerca el primer ETB sin cubrir, mayor el factor.
+  - ETB = 0 días → factor = 1 (score máximo × 2).
+  - ETB = horizonte → factor = 0 (sin bonus).
+- **Perfil histórico**: % de semanas con posición corta en los últimos 90 días.
+  No refleja precio FAS (no disponible en DB) — es un proxy de comportamiento comprador.
+- **Semáforo**: 🔴 ETB ≤ 7d | 🟡 ≤ 15d | 🟢 > 15d.
+""")
+
+
+with tab_fas:
+    _render_fas_comprador_tab(fecha_ref)
 
 
 # ---------------------------------------------------------------------------
