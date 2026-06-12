@@ -61,6 +61,17 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python update_djve.py
 
+      # Paso 3: compras MAGyP (farmer selling para la pestana MESA).
+      # Independiente: si MAGyP devuelve 403 el script sale 0 y el indice de
+      # calor degrada solo. Requiere la tabla `compras` creada (ver compras.sql).
+      - name: Update compras (MAGyP — farmer selling)
+        id: compras
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python update_compras.py
+
       # Si ISA fallo, marcamos el job como warning (no failure) imprimiendo
       # un mensaje claro. Asi el usuario sabe que ISA bloqueo pero DJVE OK.
       - name: Reportar resultado
@@ -68,8 +79,12 @@ jobs:
         run: |
           echo "ISA outcome: ${{ steps.isa.outcome }}"
           echo "DJVE outcome: ${{ steps.djve.outcome }}"
+          echo "Compras outcome: ${{ steps.compras.outcome }}"
           if [ "${{ steps.isa.outcome }}" != "success" ]; then
             echo "::warning::ISA fallo. Probable bloqueo de IPs de GitHub Actions. Considerar plan B (Supabase Edge Function)."
+          fi
+          if [ "${{ steps.compras.outcome }}" != "success" ]; then
+            echo "::warning::Compras MAGyP fallo. El componente farmer selling de MESA quedara sin dato (el indice degrada solo)."
           fi
 
       - name: Subir logs como artifact (opcional, para debug)

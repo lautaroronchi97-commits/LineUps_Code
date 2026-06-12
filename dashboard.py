@@ -816,7 +816,22 @@ def _pctl_farmer_selling(df_compras: pd.DataFrame, codigo: str,
 
 @st.cache_data(ttl=3600)
 def cached_compras_fas() -> pd.DataFrame:
-    """Compras MAGyP (farmer selling). Degrada a vacío si no hay red/datos."""
+    """
+    Compras MAGyP (farmer selling) para el índice de calor.
+
+    Prioriza la tabla `compras` de Supabase (la puebla a diario
+    update_compras.py desde una IP no bloqueada). Si la tabla está vacía —
+    p. ej. antes del primer update — cae a la descarga en vivo como
+    best-effort. Degrada a DataFrame vacío si todo falla (el índice
+    renormaliza sobre los otros componentes).
+    """
+    try:
+        from db import query_compras
+        df = query_compras()
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
     try:
         import compras_fas
         return compras_fas.descargar_compras(timeout=20)

@@ -24,10 +24,12 @@ from supabase import Client, create_client
 
 from config import (
     FETCH_PAGE_SIZE,
+    TABLA_COMPRAS,
     TABLA_DJVE,
     TABLA_LINEUP,
     UPSERT_BATCH_SIZE,
     UPSERT_CONFLICT_COLUMNS,
+    UPSERT_CONFLICT_COMPRAS,
     UPSERT_CONFLICT_DJVE,
 )
 from utils import setup_logging
@@ -501,6 +503,81 @@ def query_djve(anio: int | None = None) -> pd.DataFrame:
     if "toneladas" in df.columns:
         df["toneladas"] = pd.to_numeric(df["toneladas"], errors="coerce").fillna(0)
 
+    return df
+
+
+def upsert_compras(filas: list[dict[str, Any]],
+                   batch_size: int = UPSERT_BATCH_SIZE) -> int:
+    """
+    Inserta/actualiza filas en la tabla `compras` (comercializacion MAGyP).
+
+    Idempotente por (campana, codigo_interno, sector, fecha): si la misma
+    observacion semanal vuelve en una corrida posterior, se sobreescribe.
+
+    Args:
+        filas: lista de dicts con las keys de la tabla compras. Deben traer al
+            menos campana, codigo_interno, sector y fecha (la unique constraint).
+
+    Returns:
+        Cantidad total de filas upserted.
+    """
+    if not filas:
+        return 0
+
+    client = get_client()
+    total = 0
+    for inicio in range(0, len(filas), batch_size):
+        lote = filas[inicio:inicio + batch_size]
+        try:
+            resp = (
+                client.table(TABLA_COMPRAS)
+                .upsert(lote, on_conflict=UPSERT_CONFLICT_COMPRAS)
+                .execute()
+            )
+        except Exception as exc:
+            logger.error(
+                "Upsert compras fallo en el lote %d-%d (%d filas): %s",
+                inicio, inicio + len(lote), len(lote), exc,
+            )
+            raise
+        total += len(resp.data) if resp.data else len(lote)
+        logger.info("Upsert compras OK: lote de %d filas (acumulado %d/%d).",
+                    len(lote), total, len(filas))
+    return total
+
+
+def query_compras(campana: str | None = None) -> pd.DataFrame:
+    """
+    Lee la tabla `compras`. Devuelve un DataFrame con las mismas columnas que
+    produce `compras_fas.descargar_compras` (sin `id` ni `actualizado_en`), de
+    modo que el resto del codigo lo consume igual venga de la red o de la DB.
+
+    Args:
+        campana: si se pasa, filtra a esa campana. Si es None, trae todo.
+
+    Returns:
+        DataFrame vacio si no hay data.
+    """
+    client = get_client()
+    query = client.table(TABLA_COMPRAS).select(
+        "fecha, grano_raw, codigo_interno, campana, sector, toneladas, "
+        "toneladas_a_fijar, precio_promedio_usd, porcentaje_cosecha"
+    )
+    if campana is not None:
+        query = query.eq("campana", campana)
+    query = query.order("fecha", desc=False)
+
+    filas = _fetch_all(query)
+    df = pd.DataFrame(filas)
+    if df.empty:
+        return df
+
+    if "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
+    for col in ("toneladas", "toneladas_a_fijar", "precio_promedio_usd",
+                "porcentaje_cosecha"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 

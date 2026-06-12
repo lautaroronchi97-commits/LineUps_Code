@@ -399,3 +399,14 @@ TABLA_DJVE = "djve"
 # Clave unica para upsert idempotente de DJVE: el mismo nro_djve en el mismo
 # anio se actualiza, no se duplica. Coincide con el unique index del DDL.
 UPSERT_CONFLICT_DJVE = "anio,nro_djve"
+
+
+# Tabla compras: comercializacion de granos del MAGyP (compras de la
+# exportacion e industria al productor, semanal por campana/grano/sector).
+# La cargamos con update_compras.py. Alimenta el componente "farmer selling"
+# del indice de calor de la pestana MESA. DDL en compras.sql.
+TABLA_COMPRAS = "compras"
+
+# Clave unica para upsert idempotente de compras: una observacion semanal por
+# (campana, grano, sector, fecha). Coincide con el unique index del DDL.
+UPSERT_CONFLICT_COMPRAS = "campana,codigo_interno,sector,fecha"
