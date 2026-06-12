@@ -574,6 +574,19 @@ def _fechas_snapshot_disponibles(master: pd.DataFrame) -> list[date]:
     return sorted({f for f in fechas if f is not None})
 
 
+def _anios_djve_historia(fecha_ref: date) -> tuple[int, ...]:
+    """
+    Años de DJVE a traer para la reconstrucción as-of estacional.
+
+    Las ventanas estacionales miran hasta `CAMPANAS_HISTORIA` campañas atrás
+    (~5 años). Sin DJVE de esos años, el gap histórico se calcularía solo con
+    line-up (sesgo: hoy tiene DJVE completa, la historia no) → percentil de gap
+    inflado. Traemos desde el año actual hasta CAMPANAS_HISTORIA+1 atrás.
+    """
+    n = estacional.CAMPANAS_HISTORIA + 1
+    return tuple(fecha_ref.year - k for k in range(n))
+
+
 @st.cache_data(ttl=3600)
 def cached_djve_multianio(anios: tuple[int, ...]) -> pd.DataFrame:
     """DJVE de varios años concatenadas (para reconstrucción as-of histórica)."""
@@ -660,7 +673,7 @@ def cached_mesa_estado(fecha_ref: date) -> dict:
                     default=None)
 
     # DJVE: año actual + anterior para reconstrucción as-of.
-    djve_hist = cached_djve_multianio((fecha_ref.year, fecha_ref.year - 1))
+    djve_hist = cached_djve_multianio(_anios_djve_historia(fecha_ref))
     djve_hoy = _djve_asof(djve_hist, snap_hoy) if snap_hoy else pd.DataFrame()
 
     # Compras MAGyP (farmer selling). Puede venir vacío (degrada a None).
@@ -680,11 +693,21 @@ def cached_mesa_estado(fecha_ref: date) -> dict:
 
     lineup_hoy = _snapshot_lineup(master, snap_hoy)
     lineup_ayer = _snapshot_lineup(master, snap_ayer) if snap_ayer else pd.DataFrame()
-    # Snapshot ~K días atrás para la dirección del gap.
+    # Snapshot ~K días atrás para la dirección del gap (hoy).
     snap_k = max((s for s in snapshots
                   if s <= snap_hoy - timedelta(days=mesa_calor.K_MOMENTUM_DIAS)),
                  default=snap_ayer)
     lineup_k = _snapshot_lineup(master, snap_k) if snap_k else pd.DataFrame()
+    # Snapshot ~K días antes de AYER, para reconstruir la dirección de ayer
+    # (necesario para detectar el cambio de dirección en el tape).
+    if snap_ayer is not None:
+        snap_ayer_k = max(
+            (s for s in snapshots
+             if s <= snap_ayer - timedelta(days=mesa_calor.K_MOMENTUM_DIAS)),
+            default=None)
+        lineup_ayer_k = _snapshot_lineup(master, snap_ayer_k) if snap_ayer_k else pd.DataFrame()
+    else:
+        snap_ayer_k, lineup_ayer_k = None, pd.DataFrame()
 
     for prod in _MESA_PRODUCTOS:
         cod_camp = "SBM" if prod == "SOJA_CRUSH" else prod
@@ -714,17 +737,26 @@ def cached_mesa_estado(fecha_ref: date) -> dict:
         delta_gap = gap_hoy - gap_k
         direccion = mesa_calor.clasificar_direccion(delta_gap)
 
-        # Delta del índice vs ayer.
+        # Estado de AYER (índice, banda, dirección y gap reales) para el delta
+        # vs ayer y para el diff del tape.
         calor_ayer = None
+        gap_ayer = gap_hoy
+        direccion_ayer = direccion
         if snap_ayer is not None:
+            djve_ayer = _djve_asof(djve_hist, snap_ayer)
             gap_ayer = mesa_calor.gap_cobertura(
-                _djve_asof(djve_hist, snap_ayer), lineup_ayer, snap_ayer, prod
+                djve_ayer, lineup_ayer, snap_ayer, prod
             )
             ton_ayer = mesa_calor.tonelaje_lineup(lineup_ayer, snap_ayer, prod)
             pg = estacional.percentil_estacional(serie_gap, prod, snap_ayer, gap_ayer)
             pt = estacional.percentil_estacional(serie_ton, prod, snap_ayer, ton_ayer)
             pf = _pctl_farmer_selling(df_compras, cod_camp, snap_ayer)
             calor_ayer = mesa_calor.indice_calor(pg, pt, pf)
+            # Dirección real de ayer: gap(ayer) − gap(ayer − K).
+            if snap_ayer_k is not None:
+                gap_ayer_k = mesa_calor.gap_cobertura(
+                    djve_ayer, lineup_ayer_k, snap_ayer_k, prod)
+                direccion_ayer = mesa_calor.clasificar_direccion(gap_ayer - gap_ayer_k)
 
         delta_calor = (calor - calor_ayer) if (calor is not None
                                                and calor_ayer is not None) else None
@@ -751,8 +783,8 @@ def cached_mesa_estado(fecha_ref: date) -> dict:
         estado["estado_ayer"][prod] = {
             "calor": calor_ayer,
             "banda": mesa_calor.clasificar_banda(calor_ayer),
-            "direccion": direccion,  # aproximación: dirección estable día a día
-            "gap_tn": gap_hoy - delta_gap,
+            "direccion": direccion_ayer,
+            "gap_tn": gap_ayer,
         }
 
     return estado
@@ -848,7 +880,7 @@ def cached_mesa_embarque(fecha_ref: date) -> dict:
     if snap_hoy is None:
         return {"meses": [], "filas": {}}
 
-    djve_hist = cached_djve_multianio((fecha_ref.year, fecha_ref.year - 1))
+    djve_hist = cached_djve_multianio(_anios_djve_historia(fecha_ref))
     djve_hoy = _djve_asof(djve_hist, snap_hoy)
     lineup_hoy = _snapshot_lineup(master, snap_hoy)
 
@@ -1535,7 +1567,7 @@ def _render_mesa_tab(fecha_ref: date) -> None:
         master = cached_master_exports(cached_ultima_fecha() or fecha_ref)
         lineup_hoy = _snapshot_lineup(master, snap_hoy)
         lineup_ayer = _snapshot_lineup(master, snap_ayer)
-        djve_hist = cached_djve_multianio((fecha_ref.year, fecha_ref.year - 1))
+        djve_hist = cached_djve_multianio(_anios_djve_historia(fecha_ref))
         eventos = mesa_diff.construir_diff(
             {k: {"banda": v["banda"], "direccion": v["direccion"],
                  "calor": v["calor"], "gap_tn": v["gap_tn"]}
