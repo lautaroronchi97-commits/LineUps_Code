@@ -1,10 +1,8 @@
 name: Probe fuentes de datos (diagnostico)
 
-# Workflow de diagnostico TEMPORAL. No escribe nada.
-#
-# Fase 3: ubicar la serie/dataset exacto de comercializacion/compras de granos
-# (farmer selling) en la API de Series de Tiempo nacional (apis.datos.gob.ar,
-# confirmada 200 desde el runner) y en otros catalogos de infra.datos.gob.ar.
+# Workflow de diagnostico TEMPORAL. Fase 4 (final): grep del catalogo
+# 'produccion' (200 desde el runner) buscando compras/comercializacion/DJVE de
+# granos. Es el ultimo candidato accesible antes de concluir.
 on:
   workflow_dispatch:
 
@@ -16,43 +14,36 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     steps:
-      - name: Buscar series de comercializacion de granos
+      - name: Grep catalogo produccion por compras/comercializacion de granos
         run: |
           set +e
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-          buscar_series() {
-            local q="$1"
-            echo "############ SERIES API search: q='$q' ############"
-            curl -s -m 25 -A "$UA" \
-              "https://apis.datos.gob.ar/series/api/search/?q=$q&limit=15" \
-              -o s.json
-            python3 - <<'PY'
-          import json
+          for slug in produccion agroindustria; do
+            echo "############ Catalogo: $slug ############"
+            curl -s -m 40 -A "$UA" \
+              "https://infra.datos.gob.ar/catalog/$slug/data.json" -o "$slug.json"
+            echo "  bytes: $(wc -c < $slug.json)"
+            CATFILE="$slug.json" python3 - <<'PY'
+          import json, os
+          fn = os.environ['CATFILE']
           try:
-              d = json.load(open('s.json'))
+              cat = json.load(open(fn))
           except Exception as e:
               print("  (no JSON:", e, ")"); raise SystemExit
-          data = d.get('data', [])
-          print("  hits:", len(data))
-          for it in data:
-              f = it.get('field', {})
-              ds = it.get('dataset', {})
-              print("  - ID:", f.get('id'))
-              print("    desc:", (f.get('description') or '')[:90])
-              print("    dataset:", (ds.get('title') or '')[:70], "| fuente:", ds.get('source'))
+          ds = cat.get('dataset', [])
+          print("  datasets:", len(ds))
+          kw = ('compra', 'comercializ', 'djve', 'declaracion jurada', 'fijacion',
+                'sio', 'venta al exterior', 'exportador')
+          hit = 0
+          for d in ds:
+              blob = (str(d.get('title','')) + ' ' + str(d.get('description',''))).lower()
+              if any(k in blob for k in kw):
+                  hit += 1
+                  print("  >>", d.get('title'))
+                  for dist in d.get('distribution', [])[:6]:
+                      u = dist.get('downloadURL') or ''
+                      print("       [%s] %s" % (dist.get('format'), u))
+          print("  --- matches en %s: %d" % (fn, hit))
           PY
-          }
-
-          for q in "comercializacion+granos" "compras+granos" "soja+comercializada" \
-                   "trigo+comercializacion" "declaraciones+juradas+ventas" "maiz+comercializacion"; do
-            buscar_series "$q"
-          done
-
-          echo ""
-          echo "############ Probar otros catalogos en infra.datos.gob.ar ############"
-          for slug in magyp agroindustria produccion economia sspmicro; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 -A "$UA" \
-              "https://infra.datos.gob.ar/catalog/$slug/data.json")
-            echo "  infra catalog '$slug' -> HTTP $code"
           done
