@@ -38,26 +38,32 @@ from utils import setup_logging
 logger = setup_logging(__name__)
 
 
-def _leer_archivo(path: Path) -> pd.DataFrame:
+def _leer_bytes(content: bytes, suffix: str) -> pd.DataFrame:
     """
-    Lee un CSV o XLSX de comercializacion MAGyP y devuelve un DataFrame
-    normalizado con las mismas columnas que `compras_fas.descargar_compras()`.
+    Parsea el contenido binario de un archivo MAGyP (CSV o Excel) y devuelve
+    un DataFrame normalizado identico al de `compras_fas.descargar_compras()`.
 
-    Si el formato no es reconocido o las columnas esperadas no se encuentran,
-    levanta ValueError con un mensaje descriptivo.
+    Args:
+        content: bytes del archivo (de Path.read_bytes() o UploadedFile.getvalue()).
+        suffix:  extension sin punto, en minusculas ("csv", "xlsx", "xls").
+
+    Raises:
+        ValueError: si el formato no es reconocido o las columnas no coinciden.
     """
-    suffix = path.suffix.lower()
+    import io as _io
+    buf = _io.BytesIO(content)
 
-    if suffix in (".xlsx", ".xls"):
+    if suffix in ("xlsx", "xls"):
         try:
-            raw = pd.read_excel(path, dtype=str)
+            raw = pd.read_excel(buf, dtype=str)
         except Exception as exc:
             raise ValueError(f"No se pudo leer el archivo Excel: {exc}") from exc
-    elif suffix == ".csv":
+    elif suffix == "csv":
         try:
-            raw = pd.read_csv(path, encoding="utf-8", dtype=str, on_bad_lines="skip")
+            raw = pd.read_csv(buf, encoding="utf-8", dtype=str, on_bad_lines="skip")
         except UnicodeDecodeError:
-            raw = pd.read_csv(path, encoding="latin-1", dtype=str, on_bad_lines="skip")
+            buf.seek(0)
+            raw = pd.read_csv(buf, encoding="latin-1", dtype=str, on_bad_lines="skip")
         except Exception as exc:
             raise ValueError(f"No se pudo leer el CSV: {exc}") from exc
     else:
@@ -66,7 +72,7 @@ def _leer_archivo(path: Path) -> pd.DataFrame:
         )
 
     if raw.empty:
-        raise ValueError("El archivo esta vacio.")
+        raise ValueError("El archivo está vacío.")
 
     # Normalizar nombres de columna igual que descargar_compras().
     raw.columns = [c.lower().strip().replace(" ", "_") for c in raw.columns]
@@ -122,6 +128,34 @@ def _leer_archivo(path: Path) -> pd.DataFrame:
             df[col_opt] = pd.to_numeric(df[candidates[0]], errors="coerce")
 
     return df
+
+
+def _leer_archivo(path: Path) -> pd.DataFrame:
+    """Wrapper sobre `_leer_bytes` para leer desde una ruta local."""
+    suffix = path.suffix.lstrip(".").lower()
+    return _leer_bytes(path.read_bytes(), suffix)
+
+
+def resumen_granos_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve un DataFrame con el resumen de granos encontrados en el archivo.
+    Columnas: grano_raw, codigo_interno, toneladas_kt, mapeado.
+    Usado por el dashboard para mostrar el preview antes de confirmar.
+    """
+    if "grano_raw" not in df.columns or df.empty:
+        return pd.DataFrame(columns=["Grano", "Codigo", "Toneladas (kt)", "Estado"])
+    grp = (
+        df.groupby(["grano_raw", "codigo_interno"], dropna=False)["toneladas"]
+        .sum()
+        .reset_index()
+    )
+    grp["Estado"] = grp["codigo_interno"].apply(
+        lambda c: f"✅ {c}" if pd.notna(c) else "⚠️ sin mapeo (se omite)"
+    )
+    grp["Toneladas (kt)"] = (grp["toneladas"] / 1000).round(1)
+    return grp.rename(columns={"grano_raw": "Grano", "codigo_interno": "Codigo"})[
+        ["Grano", "Codigo", "Toneladas (kt)", "Estado"]
+    ]
 
 
 def cargar(ruta: str) -> tuple[int, int]:

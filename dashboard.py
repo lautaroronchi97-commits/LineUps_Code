@@ -91,7 +91,9 @@ from db import (
     query_lineup,
     ultima_actualizacion_lineup,
     ultima_fecha_cargada,
+    upsert_compras_local,
 )
+import cargar_compras as _cargar_compras_mod
 from shipper_norm import SHIPPERS_TOP, aplicar_a_dataframe
 import fas_comprador
 
@@ -1324,13 +1326,14 @@ _render_senales_hoy()
 # Pestanas
 # ===========================================================================
 
-tab_mesa, tab_pan, tab_shp, tab_prd, tab_cng, tab_fas = st.tabs([
+tab_mesa, tab_pan, tab_shp, tab_prd, tab_cng, tab_fas, tab_carga = st.tabs([
     "🔥 MESA",
     "📊 PANORAMA",
     "🏢 SHIPPERS",
     "🌾 PRODUCTOS",
     "⚓ CONGESTION",
     "🎯 COMPRADORES FAS",
+    "📤 CARGA",
 ])
 
 
@@ -3498,6 +3501,102 @@ def _render_fas_comprador_tab(fecha_ref: date) -> None:
 
 with tab_fas:
     _render_fas_comprador_tab(fecha_ref)
+
+
+# ===========================================================================
+# Pestaña CARGA: carga manual de compras MAGyP
+# ===========================================================================
+
+def _render_carga_compras_tab() -> None:
+    st.subheader("📤 Carga de Comercialización MAGyP")
+    st.caption(
+        "Subí el archivo semanal de compras (SIO-Granos) para actualizar "
+        "la base. Solo funciona en modo local (.env con SERVICE_ROLE_KEY)."
+    )
+
+    # Verificar disponibilidad de la clave de escritura.
+    tiene_write_key = bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
+    if not tiene_write_key:
+        st.warning(
+            "**Panel de carga deshabilitado en Streamlit Cloud.**\n\n"
+            "Para subir datos, corré el dashboard localmente con `.env` completo "
+            "(incluyendo `SUPABASE_SERVICE_ROLE_KEY`), "
+            "o usá el script desde terminal:\n"
+            "```\npython cargar_compras.py ruta/al/archivo.csv\n```"
+        )
+        return
+
+    st.markdown(
+        "**Dónde bajar el archivo:** "
+        "[datos.magyp.gob.ar → Comercialización de Granos](https://datos.magyp.gob.ar/dataset/compras-de-granos) "
+        "→ descargar el CSV o XLSX más reciente desde tu navegador (Argentina)."
+    )
+    st.divider()
+
+    uploaded = st.file_uploader(
+        "Subí la planilla del MAGyP",
+        type=["csv", "xlsx", "xls"],
+        help="CSV o XLSX de comercialización de granos (SIO-Granos MAGyP).",
+        key="carga_compras_uploader",
+    )
+
+    if uploaded is None:
+        st.info("Subí un archivo para continuar.")
+        return
+
+    # Parsear el archivo subido.
+    suffix = uploaded.name.rsplit(".", 1)[-1].lower()
+    try:
+        df_preview = _cargar_compras_mod._leer_bytes(uploaded.getvalue(), suffix)
+    except ValueError as exc:
+        st.error(f"No se pudo leer el archivo:\n\n{exc}")
+        return
+
+    filas_preview = _cargar_compras_mod._df_a_filas(df_preview)
+
+    # Preview: resumen por grano.
+    st.markdown(f"**Archivo:** `{uploaded.name}` · {len(df_preview):,} filas leídas")
+    resumen = _cargar_compras_mod.resumen_granos_df(df_preview)
+    st.dataframe(resumen, use_container_width=True, hide_index=True)
+
+    mapeadas = resumen["Estado"].str.startswith("✅").sum()
+    omitidas = len(resumen) - mapeadas
+    col_ok, col_warn = st.columns(2)
+    col_ok.metric("Granos mapeados", mapeadas)
+    if omitidas:
+        col_warn.metric("Sin mapeo (se omiten)", omitidas, delta_color="off")
+
+    if not filas_preview:
+        st.error(
+            "Ninguna fila tiene codigo_interno + sector + fecha válidos. "
+            "Verificá que sea la planilla correcta del MAGyP."
+        )
+        return
+
+    st.success(f"**{len(filas_preview):,} filas listas para subir a Supabase.**")
+
+    if st.button("⬆️ Confirmar y subir a Supabase", type="primary",
+                 key="btn_confirmar_carga"):
+        with st.spinner("Subiendo datos..."):
+            try:
+                upsert_compras_local(filas_preview)
+            except RuntimeError as exc:
+                st.error(f"Error de credenciales: {exc}")
+                return
+            except Exception as exc:
+                st.error(f"Error al subir datos: {exc}")
+                return
+
+        st.success(
+            f"✅ **{len(filas_preview):,} filas cargadas correctamente.** "
+            "El índice MESA y COMPRADORES FAS reflejarán los nuevos datos en el próximo refresco."
+        )
+        # Limpiar el cache de compras para que el dashboard tome los datos nuevos.
+        cached_compras_fas.clear()
+
+
+with tab_carga:
+    _render_carga_compras_tab()
 
 
 # ---------------------------------------------------------------------------

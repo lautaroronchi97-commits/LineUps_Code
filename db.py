@@ -95,6 +95,64 @@ def get_client() -> Client:
 # Upsert
 # ---------------------------------------------------------------------------
 
+def get_write_client() -> Client:
+    """
+    Crea un cliente Supabase usando SUPABASE_SERVICE_ROLE_KEY (escritura completa).
+
+    Solo para uso local: scripts de carga manual y panel de administracion del
+    dashboard corriendo con .env completo. Nunca exponer esta clave en Streamlit Cloud.
+
+    Raises:
+        RuntimeError: si SUPABASE_SERVICE_ROLE_KEY no esta definida en el entorno.
+    """
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY no encontrada.\n"
+            "Completar .env con SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY "
+            "(ver .env.example). Esta funcion solo funciona en modo local."
+        )
+    return create_client(url, key)
+
+
+def upsert_compras_local(filas: list[dict[str, Any]],
+                         batch_size: int = UPSERT_BATCH_SIZE) -> int:
+    """
+    Upsert de compras MAGyP usando la clave de servicio.
+
+    Identico a `upsert_compras` pero crea el cliente con SERVICE_ROLE_KEY en lugar
+    de ANON_KEY, necesario cuando el dashboard corre localmente (ANON_KEY es
+    solo lectura por RLS). Solo para el panel de carga manual del dashboard.
+    """
+    if not filas:
+        return 0
+    client = get_write_client()
+    total = 0
+    for inicio in range(0, len(filas), batch_size):
+        lote = filas[inicio:inicio + batch_size]
+        try:
+            resp = (
+                client.table(TABLA_COMPRAS)
+                .upsert(lote, on_conflict=UPSERT_CONFLICT_COMPRAS)
+                .execute()
+            )
+        except Exception as exc:
+            logger.error(
+                "Upsert compras_local fallo en lote %d-%d: %s",
+                inicio, inicio + len(lote), exc,
+            )
+            raise
+        total += len(resp.data) if resp.data else len(lote)
+        logger.info("Upsert compras_local OK: %d filas (acumulado %d/%d).",
+                    len(lote), total, len(filas))
+    return total
+
+
 def upsert_lineup(filas: list[dict[str, Any]], batch_size: int = UPSERT_BATCH_SIZE) -> int:
     """
     Inserta (o actualiza si ya existen) filas en la tabla `lineup`.
