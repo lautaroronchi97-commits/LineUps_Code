@@ -91,7 +91,7 @@ from db import (
     query_lineup,
     ultima_actualizacion_lineup,
     ultima_fecha_cargada,
-    upsert_compras_local,
+    upsert_compras,
 )
 import cargar_compras as _cargar_compras_mod
 from shipper_norm import SHIPPERS_TOP, aplicar_a_dataframe
@@ -3510,21 +3510,9 @@ with tab_fas:
 def _render_carga_compras_tab() -> None:
     st.subheader("📤 Carga de Comercialización MAGyP")
     st.caption(
-        "Subí el archivo semanal de compras (SIO-Granos) para actualizar "
-        "la base. Solo funciona en modo local (.env con SERVICE_ROLE_KEY)."
+        "Subí el archivo semanal de compras (SIO-Granos) para actualizar la base. "
+        "La carga escribe en la tabla `compras` vía RLS pública."
     )
-
-    # Verificar disponibilidad de la clave de escritura.
-    tiene_write_key = bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
-    if not tiene_write_key:
-        st.warning(
-            "**Panel de carga deshabilitado en Streamlit Cloud.**\n\n"
-            "Para subir datos, corré el dashboard localmente con `.env` completo "
-            "(incluyendo `SUPABASE_SERVICE_ROLE_KEY`), "
-            "o usá el script desde terminal:\n"
-            "```\npython cargar_compras.py ruta/al/archivo.csv\n```"
-        )
-        return
 
     st.markdown(
         "**Dónde bajar el archivo:** "
@@ -3579,12 +3567,13 @@ def _render_carga_compras_tab() -> None:
                  key="btn_confirmar_carga"):
         with st.spinner("Subiendo datos..."):
             try:
-                upsert_compras_local(filas_preview)
-            except RuntimeError as exc:
-                st.error(f"Error de credenciales: {exc}")
-                return
+                upsert_compras(filas_preview)
             except Exception as exc:
-                st.error(f"Error al subir datos: {exc}")
+                st.error(
+                    f"Error al subir datos: {exc}\n\n"
+                    "Si dice 'row-level security', falta correr las políticas de "
+                    "escritura de `compras.sql` en el SQL Editor de Supabase."
+                )
                 return
 
         st.success(
