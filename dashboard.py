@@ -81,7 +81,8 @@ from config import (
     PRODUCTO_DISPLAY,
     PRODUCTOS_PRIORITARIOS,
     SHIPPER_COLORS,
-    zona_de_puerto,
+    colapsar_producto,
+    zona_carga,
 )
 from db import (
     ping,
@@ -96,6 +97,7 @@ from db import (
 )
 import cargar_compras as _cargar_compras_mod
 from shipper_norm import SHIPPERS_TOP, aplicar_a_dataframe
+import compras_fas
 import fas_comprador
 
 # ===========================================================================
@@ -480,9 +482,18 @@ def cached_en_puerto_ahora(fecha: date) -> pd.DataFrame:
     df = query_en_puerto_ahora(fecha)
     if df.empty:
         return df
+    # Solo carga (LOAD) y solo los productos prioritarios (con colapso SHULLS->SBM).
+    if "ops" in df.columns:
+        df = df[df["ops"] == "LOAD"].copy()
+    if "cargo" in df.columns:
+        df["cargo"] = df["cargo"].map(colapsar_producto)
+        df = df[df["cargo"].isin(CODIGOS_PRIORITARIOS)].copy()
+    if df.empty:
+        return df
     df = aplicar_a_dataframe(df)
-    mapa_zona = {p: zona_de_puerto(p) for p in df["port"].unique()}
-    df["zona"] = df["port"].map(mapa_zona)
+    df["zona"] = [
+        zona_carga(p, b) for p, b in zip(df["port"], df.get("berth", df["port"]))
+    ]
     return df
 
 
@@ -521,8 +532,9 @@ def cached_serie_congestion(desde: date, hasta: date) -> pd.DataFrame:
     if df_ep.empty:
         return pd.DataFrame()
 
-    mapa_zona = {p: zona_de_puerto(p) for p in df_ep["port"].unique()}
-    df_ep["zona"] = df_ep["port"].map(mapa_zona)
+    df_ep["zona"] = [
+        zona_carga(p, b) for p, b in zip(df_ep["port"], df_ep.get("berth", df_ep["port"]))
+    ]
     return (
         df_ep.groupby(["fecha", "zona"])["vessel"]
         .nunique().reset_index(name="buques")
@@ -575,6 +587,22 @@ def cached_fas_perfiles(fecha_ref: date) -> dict[tuple[str, str], dict]:
             df_lineup_hist, shipper_canon, codigo_interno, df_djve_hist, fecha_ref
         )
     return perfiles
+
+
+@st.cache_data(ttl=900, show_spinner="Calculando posición de la exportación...")
+def cached_posicion_exportadora(fecha_ref: date, horizonte_dias: int = 60) -> pd.DataFrame:
+    """
+    Posición declarado (DJVE) vs comprado (FAS/MAGyP) vs embarcado (line-up)
+    por producto, para la sección "Posición de la exportación" de la pestaña
+    PRODUCTOS. Responde directamente "¿está comprada/vendida la exportación?"
+    y "¿hay mucho [producto] para embarcar y poco comprado?".
+    """
+    df_lineup = cached_master_exports(cached_ultima_fecha() or fecha_ref)
+    df_djve = cached_djve(fecha_ref.year)
+    df_compras = cached_compras_fas()
+    return compras_fas.posicion_exportadora(
+        df_djve, df_compras, df_lineup, fecha_ref, horizonte_dias
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1338,7 +1366,7 @@ def _render_senales_hoy():
                 alertas_success.append(
                     f"🚢 **Buque nuevo grande** · {_row['vessel']} · "
                     f"{_row.get('cargo','?')} · {_qty_fmt} · "
-                    f"Shipper: {_shp} · Puerto: {_row.get('port','?')}"
+                    f"Comprador: {_shp} · Puerto: {_row.get('port','?')}"
                 )
 
     # ---- Alerta: z-score de shippers (usando calc ya existente) ----
@@ -1397,9 +1425,9 @@ _render_senales_hoy()
 _TABS = [
     "🔥 MESA",
     "📊 PANORAMA",
-    "🏢 SHIPPERS",
+    "🏢 COMPRADORES",
     "🌾 PRODUCTOS",
-    "⚓ CONGESTION",
+    "⚓ CONGESTIÓN",
     "🎯 COMPRADORES FAS",
     "📤 CARGA",
 ]
@@ -1783,16 +1811,20 @@ def _render_mesa_zonas(fecha_ref: date, snap_hoy: date) -> None:
     snapshots = _fechas_snapshot_disponibles(master)
 
     zonas = {
-        "UP-RIVER ROSARIO": ("Gran Rosario Norte", "Gran Rosario Sur"),
+        "UP RIVER NORTE": ("Up River Norte",),
+        "UP RIVER SUR": ("Up River Sur",),
         "BAHÍA BLANCA": ("Bahia Blanca",),
         "QUEQUÉN": ("Necochea/Quequen",),
     }
     productos = ["MAIZE", "WHEAT", "SOJA_CRUSH"]
-    cols = st.columns(3)
+    cols = st.columns(4)
 
     if not lineup_hoy.empty:
         lineup_hoy = lineup_hoy.copy()
-        lineup_hoy["_zona"] = lineup_hoy["port"].map(zona_de_puerto)
+        lineup_hoy["_zona"] = [
+            zona_carga(p, b)
+            for p, b in zip(lineup_hoy["port"], lineup_hoy.get("berth", lineup_hoy["port"]))
+        ]
 
     for col, (zona_label, zona_keys) in zip(cols, zonas.items()):
         with col:
@@ -1892,7 +1924,10 @@ def _pctl_tonelaje_zona(master, zona_keys, codigos, prod, fecha_ref,
     lineup_hoy = _snapshot_lineup(master, snap_hoy)
     if not lineup_hoy.empty:
         lineup_hoy = lineup_hoy.copy()
-        lineup_hoy["_zona"] = lineup_hoy["port"].map(zona_de_puerto)
+        lineup_hoy["_zona"] = [
+            zona_carga(p, b)
+            for p, b in zip(lineup_hoy["port"], lineup_hoy.get("berth", lineup_hoy["port"]))
+        ]
         lineup_hoy = lineup_hoy[lineup_hoy["_zona"].isin(zona_keys)]
     ton_hoy = _tonelaje_zona(lineup_hoy, codigos, snap_hoy)
 
@@ -1905,7 +1940,10 @@ def _pctl_tonelaje_zona(master, zona_keys, codigos, prod, fecha_ref,
             if ld.empty:
                 continue
             ld = ld.copy()
-            ld["_zona"] = ld["port"].map(zona_de_puerto)
+            ld["_zona"] = [
+                zona_carga(p, b)
+                for p, b in zip(ld["port"], ld.get("berth", ld["port"]))
+            ]
             ld = ld[ld["_zona"].isin(zona_keys)]
             registros.append((snap, prod, _tonelaje_zona(ld, codigos, snap)))
     serie = estacional.construir_serie(registros)
@@ -2251,13 +2289,13 @@ def _render_panorama_tab(fecha_ref, ventana_dias):
             "Producto":       display,
             "Cargando":       b_cargando,
             "Arribando":      b_arribando,
-            "Tons hoy":       fmt_tons(tons_p_hoy),
+            "Toneladas hoy":  fmt_tons(tons_p_hoy),
             f"Prom {ventana_dias}d": fmt_tons(tons_p_prom),
             "vs prom":        pct_change(tons_p_hoy, tons_p_prom),
             "Δ sem":          pct_change(tons_sem_act, tons_sem_ant),
-            "Top shipper":    top_ship,
-            "Top destino":    top_dest,
-            "Campana":        camp_actual,
+            "Comprador top":  top_ship,
+            "Destino top":    top_dest,
+            "Campaña":        camp_actual,
             # Columna interna para ordenar por valor numerico real, ya que la
             # columna "Tons hoy" esta formateada como string ("46K").
             "_tons_hoy_raw":  float(tons_p_hoy or 0),
@@ -2283,8 +2321,8 @@ def _render_panorama_tab(fecha_ref, ventana_dias):
 
     st.divider()
 
-    # ------------------- Heatmap puerto x producto -------------------
-    st.subheader(f"Heatmap · puerto × producto · {fecha_ref}")
+    # ------------------- Mapa de calor puerto x producto -------------------
+    st.subheader(f"Mapa de calor · puerto × producto · {fecha_ref}")
 
     if df_hoy.empty:
         st.info("Sin data para hoy.")
@@ -2305,7 +2343,7 @@ def _render_panorama_tab(fecha_ref, ventana_dias):
                     [0.5, BLOOMBERG_PALETTE["accent_blue"]],
                     [1.0, BLOOMBERG_PALETTE["accent"]],
                 ],
-                labels={"color": "Tons"},
+                labels={"color": "Toneladas"},
             )
             aplicar_tema(fig_hm)
             fig_hm.update_layout(height=max(300, 40 + 22 * len(pivot)))
@@ -2340,13 +2378,14 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     df_shp_vent = df_shp_vent[df_shp_vent["fecha_consulta"] == _ult_foto_shp]
 
     # ------------------- Ranking por shipper en la ventana -------------------
-    st.subheader(f"Ranking top 10 · ultimos {ventana_dias} dias")
+    st.subheader(f"Ranking de compradores · últimos {ventana_dias} días")
 
     # Agregado ventana.
+    # Solo compradores diferenciados; "OTROS" no se lista (pedido del usuario).
     agg_vent = (
         df_shp_vent.groupby("shipper_canon")
         .agg(buques=("vessel", "nunique"), tons=("quantity", "sum"))
-        .reindex(SHIPPERS_TOP + ["OTROS"], fill_value=0)
+        .reindex(SHIPPERS_TOP, fill_value=0)
         .reset_index()
         .rename(columns={"shipper_canon": "Shipper"})
     )
@@ -2365,13 +2404,17 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     df_senales["Tons"] = df_senales["tons"].apply(fmt_tons)
     df_senales = df_senales.drop(columns=["tons"])
     df_senales = df_senales.sort_values("Z-score", ascending=False)
+    df_senales = df_senales.rename(columns={
+        "Shipper": "Comprador", "Senal": "Señal", "Tons": "Toneladas",
+        "Buques (vent)": "Buques (vent.)",
+    })
 
     st.dataframe(
         df_senales,
         use_container_width=True,
         hide_index=True,
         column_order=[
-            "Shipper", "Senal", "Buques (vent)", "Media hist.", "σ", "Z-score", "Tons",
+            "Comprador", "Señal", "Buques (vent.)", "Media hist.", "σ", "Z-score", "Toneladas",
         ],
         height=420,
     )
@@ -2385,9 +2428,9 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     )
 
     st.caption(
-        "Senal basada en z-score del conteo de buques propios contra ultimos "
-        "2 anos del mismo shipper. 🔥 = z≥2 (mas barcos que lo normal, senal "
-        "de trade). 🔴 = z≤-2 (muy por debajo de su media historica)."
+        "Señal basada en z-score del conteo de buques propios contra los últimos "
+        "2 años del mismo comprador. 🔥 = z≥2 (más barcos que lo normal, señal "
+        "de compra). 🔴 = z≤-2 (muy por debajo de su media histórica)."
     )
 
     st.divider()
@@ -2396,13 +2439,16 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.caption(f"Toneladas por shipper · ultimos {ventana_dias}d")
+        st.caption(f"Toneladas por comprador · últimos {ventana_dias}d")
         agg_tons = (
             df_shp_vent.groupby("shipper_canon")["quantity"].sum()
             .reset_index()
             .rename(columns={"shipper_canon": "Shipper", "quantity": "Tons"})
         )
-        agg_tons = agg_tons[agg_tons["Tons"] > 0].sort_values("Tons", ascending=True)
+        # Ocultar "OTROS": solo compradores diferenciados.
+        agg_tons = agg_tons[
+            (agg_tons["Tons"] > 0) & (agg_tons["Shipper"] != "OTROS")
+        ].sort_values("Tons", ascending=True)
         colors = [SHIPPER_COLORS.get(s, SHIPPER_COLORS["OTROS"]) for s in agg_tons["Shipper"]]
 
         fig_tons = go.Figure()
@@ -2452,7 +2498,7 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     # embarco mas TONELADAS hoy. Esta tabla responde: cuanto tonelaje cargo
     # cada shipper en los ultimos 3 meses, y como se compara contra el mes
     # anterior (Δ MoM) y contra el mismo mes hace 12 meses (Δ YoY).
-    st.subheader("Actividad mensual top 10 · ultimos 3 meses")
+    st.subheader("Actividad mensual top 10 · últimos 3 meses")
     st.caption(
         "Toneladas por shipper en los ultimos 3 meses. Δ MoM = variacion vs "
         "mes anterior. Δ YoY = variacion vs mismo mes hace 12 meses."
@@ -2468,7 +2514,10 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
             reverse=True,
         )
         fmc1, fmc2 = st.columns(2)
-        f_prod_mes = fmc1.selectbox("Producto", _prod_opts, key="shp_mes_prod")
+        f_prod_mes = fmc1.selectbox(
+            "Producto", _prod_opts, key="shp_mes_prod",
+            format_func=lambda c: "Todos" if c == "Todos" else PRODUCTO_DISPLAY.get(c, c),
+        )
         f_camp_mes = fmc2.selectbox("Cosecha", _camp_opts_shp, key="shp_mes_camp")
 
     hoy_per_shp = pd.Period(fecha_ref, freq="M")
@@ -2559,9 +2608,9 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     st.divider()
 
     # ------------------- Drill-down: shipper seleccionado -------------------
-    st.subheader("Drill-down por shipper")
+    st.subheader("Detalle por comprador")
     shipper_sel = st.selectbox(
-        "Seleccionar shipper",
+        "Seleccionar comprador",
         options=SHIPPERS_TOP,
         index=0,
     )
@@ -2629,13 +2678,103 @@ if _tab_sel == "🔥 MESA":
 if _tab_sel == "📊 PANORAMA":
     _render_panorama_tab(fecha_ref, ventana_dias)
 
-if _tab_sel == "🏢 SHIPPERS":
+if _tab_sel == "🏢 COMPRADORES":
     _render_shippers_tab(fecha_ref, ventana_dias)
 
 
 # ==========================================================================
 # PESTANA 3: PRODUCTOS (vista por producto con comparacion de campanas)
 # ==========================================================================
+
+_SEÑAL_PRESION_COLOR = {
+    "PRESION COMPRADORA": BLOOMBERG_PALETTE["negative"],
+    "PRESION VENDEDORA": BLOOMBERG_PALETTE["positive"],
+    "CORTO_EMBARQUE": BLOOMBERG_PALETTE["warning"],
+}
+_SEÑAL_PRESION_EMOJI = {
+    "PRESION COMPRADORA": "🔴",
+    "PRESION VENDEDORA": "🟢",
+    "CORTO_EMBARQUE": "🟡",
+}
+
+
+def _render_posicion_exportadora(fecha_ref: date) -> None:
+    """
+    Posición de la exportación por producto: declarado (DJVE) vs comprado
+    (FAS/MAGyP) vs embarcado (line-up). Responde "¿la exportación está
+    comprada/vendida?" y "¿hay mucho [producto] para embarcar y poco
+    comprado?" (preguntas del vendedor FAS que no cubría ninguna pestaña).
+    """
+    st.markdown("### 📐 Posición de la exportación")
+    st.caption(
+        "Declarado (DJVE) vs comprado (FAS/MAGyP) vs embarcado (line-up) — "
+        "ventana de 60 días. Faltante de compra > 0 = la expo está corta y "
+        "debe salir a comprar al FAS → presión alcista para el vendedor."
+    )
+
+    posicion = cached_posicion_exportadora(fecha_ref)
+    if posicion.empty:
+        st.info("Sin datos suficientes de DJVE para calcular la posición.")
+        return
+
+    señales = compras_fas.senales_presion(posicion)
+    mapa_señal = {row["codigo_interno"]: row for _, row in señales.iterrows()}
+
+    display = posicion.copy()
+    display["señal"] = display["codigo_interno"].map(
+        lambda c: mapa_señal.get(c, {}).get("senal", "NEUTRAL")
+    )
+
+    def _fmt_señal(s: str) -> str:
+        return f"{_SEÑAL_PRESION_EMOJI.get(s, '⚪')} {s.replace('_', ' ')}"
+
+    tabla = display[[
+        "producto_display", "declarado_tn", "comprado_tn", "embarcado_tn",
+        "falta_comprar_tn", "ratio_compra", "ratio_embarque", "señal",
+    ]].rename(columns={
+        "producto_display": "Producto",
+        "declarado_tn": "Declarado (tn)",
+        "comprado_tn": "Comprado (tn)",
+        "embarcado_tn": "Embarcado (tn)",
+        "falta_comprar_tn": "Falta comprar (tn)",
+        "ratio_compra": "Cobertura compra",
+        "ratio_embarque": "Cobertura embarque",
+        "señal": "Señal",
+    })
+    for col_tn in ("Declarado (tn)", "Comprado (tn)", "Embarcado (tn)", "Falta comprar (tn)"):
+        tabla[col_tn] = tabla[col_tn].apply(
+            lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+        )
+    for col_pct in ("Cobertura compra", "Cobertura embarque"):
+        tabla[col_pct] = tabla[col_pct].apply(
+            lambda v: f"{v:.0%}" if pd.notna(v) else "—"
+        )
+    tabla["Señal"] = tabla["Señal"].apply(_fmt_señal)
+
+    st.dataframe(tabla, use_container_width=True, hide_index=True)
+
+    if not señales.empty:
+        st.markdown("##### Racional de las señales activas")
+        for _, row in señales.iterrows():
+            emoji = _SEÑAL_PRESION_EMOJI.get(row["senal"], "⚪")
+            st.markdown(
+                f"{emoji} **{row['producto_display']} · {row['senal'].replace('_', ' ')}** "
+                f"(intensidad {row['intensidad']}/5) — {row['racional']}"
+            )
+
+    with st.expander("ℹ️ Metodología"):
+        st.markdown("""
+**Declarado** = DJVE con ventana de embarque solapando los próximos 60 días.
+**Comprado** = compras de la exportación (SIO-Granos/MAGyP) acumuladas en la campaña vigente —
+si la tabla `compras` está vacía, esta columna y la señal de compra quedan en blanco.
+**Embarcado** = buques con ETB en los próximos 60 días (line-up).
+
+- **Falta comprar** = Declarado − Comprado. Si es alto y positivo, la expo está corta en el FAS.
+- 🔴 **PRESION COMPRADORA**: cobertura de compra < 80% → debe salir a comprar, sesgo alcista para el vendedor.
+- 🟢 **PRESION VENDEDORA**: cobertura de compra > 125% → expo larga, puede bajar el bid.
+- 🟡 **CORTO EMBARQUE**: sin dato de compras FAS pero cobertura de embarque < 70% (proxy de posición corta).
+""")
+
 
 @st.fragment
 def _render_productos_tab(fecha_ref):
@@ -2645,6 +2784,9 @@ def _render_productos_tab(fecha_ref):
     del dashboard (Panorama, Shippers, Congestion) NO se vuelve a calcular.
     Sin esto, cambiar producto re-disparaba todo el script y la UI se tildaba.
     """
+    _render_posicion_exportadora(fecha_ref)
+    st.divider()
+
     col_sel, col_info = st.columns([1, 3])
     with col_sel:
         opciones = [(codigo, display) for codigo, display, _ in PRODUCTOS_PRIORITARIOS]
@@ -2773,7 +2915,7 @@ def _render_productos_tab(fecha_ref):
         st.divider()
 
         # ------------------- Chart principal: campana actual vs historicas -------------------
-        st.subheader(f"Cargamento acumulado · dia-de-campana (vs ultimas 5)")
+        st.subheader(f"Cargamento acumulado · día-de-campaña (vs últimas 5)")
 
         # Construir serie acumulada por campana.
         series_por_camp = {}
@@ -2862,18 +3004,18 @@ def _render_productos_tab(fecha_ref):
             tons = sub["quantity"].fillna(0).sum()
             buques = sub["vessel"].nunique()
             tabla_cmp.append({
-                "Campana": camp,
+                "Campaña": camp,
                 "Buques":  buques,
-                "Tons":    fmt_tons(tons),
-                "Tons_raw": tons,  # para ordenar
+                "Toneladas": fmt_tons(tons),
+                "_tons_raw": tons,  # para ordenar
             })
         df_cmp = pd.DataFrame(tabla_cmp)
-        df_cmp = df_cmp.sort_values("Campana", ascending=False)
+        df_cmp = df_cmp.sort_values("Campaña", ascending=False)
         st.dataframe(
-            df_cmp.drop(columns=["Tons_raw"]),
+            df_cmp.drop(columns=["_tons_raw"]),
             use_container_width=True, hide_index=True,
         )
-        _csv_productos = df_cmp.drop(columns=["Tons_raw"]).to_csv(index=False).encode("utf-8")
+        _csv_productos = df_cmp.drop(columns=["_tons_raw"]).to_csv(index=False).encode("utf-8")
         st.download_button(
             label="⬇ Descargar CSV",
             data=_csv_productos,
@@ -2916,11 +3058,11 @@ def _render_productos_tab(fecha_ref):
 
                 if not fila.empty:
                     k1, k2, k3 = st.columns(3)
-                    k1.metric("DJVE ultimos 30d (tons)",
+                    k1.metric("DJVE últimos 30d (ton)",
                               fmt_tons(fila.iloc[0]["toneladas"]))
                     k2.metric("N° de declaraciones",
                               int(fila.iloc[0]["n_djve"]))
-                    k3.metric("Top exportador",
+                    k3.metric("Comprador top",
                               fila.iloc[0]["razon_social_top"][:25])
 
                 # Chart: barras diarias.
@@ -3061,7 +3203,7 @@ def _render_productos_tab(fecha_ref):
 
         # ------------------- Top shippers de este producto -------------------
         st.divider()
-        st.subheader(f"Top shippers de {display_prd} · campana {campana_actual}")
+        st.subheader(f"Top compradores de {display_prd} · campaña {campana_actual}")
         top_shp = (
             df_actual.groupby("shipper_canon")["quantity"].sum()
             .sort_values(ascending=True).reset_index()
@@ -3081,7 +3223,7 @@ def _render_productos_tab(fecha_ref):
 
         # ------------------- Estimaciones MAGyP: contexto macro ---------------
         st.divider()
-        st.subheader(f"Produccion historica · {display_prd} (MAGyP)")
+        st.subheader(f"Producción histórica · {display_prd} (MAGyP)")
         st.caption(
             "Estimaciones oficiales MAGyP por campana cerrada. "
             "Util para dimensionar el line-up contra produccion real. "
@@ -3232,34 +3374,35 @@ def _render_congestion_tab(fecha_ref):
                 pd.to_datetime(x["etb"]) - pd.to_datetime(x["eta"])
             ).dt.days,
             destino=lambda x: x["dest_orig"].fillna("s/d").str.strip().str.upper(),
+            producto=lambda x: x["cargo"].map(PRODUCTO_DISPLAY).fillna(x["cargo"]),
         )[
-            ["zona", "port", "vessel", "cargo", "quantity", "shipper_canon",
+            ["zona", "port", "berth", "vessel", "producto", "quantity", "shipper_canon",
              "destino", "eta", "etb", "ets", "dias_en_puerto", "demora_eta", "remarks"]
         ].rename(columns={
-            "zona": "Zona", "port": "Puerto", "vessel": "Buque",
-            "cargo": "Producto", "quantity": "Tons",
-            "shipper_canon": "Shipper", "destino": "Destino",
-            "eta": "ETA orig", "etb": "ETB", "ets": "ETS",
-            "dias_en_puerto": "Dias en puerto",
+            "zona": "Zona", "port": "Puerto", "berth": "Muelle", "vessel": "Buque",
+            "producto": "Producto", "quantity": "Toneladas",
+            "shipper_canon": "Comprador", "destino": "Destino",
+            "eta": "ETA", "etb": "ETB", "ets": "ETS",
+            "dias_en_puerto": "Días en puerto",
             "demora_eta": "Demora ETA (d)",
             "remarks": "Estado",
         })
         df_det = df_det.sort_values(["Zona", "Puerto"])
 
-        # Filtros: Producto, Shipper, Zona, Destino en una fila.
+        # Filtros: Producto, Comprador, Zona, Destino en una fila.
         fc1, fc2, fc3, fc4 = st.columns(4)
         f_prod  = fc1.multiselect(
-            "Producto", sorted(df_det["Producto"].dropna().unique()), key="cng_prod")
+            "Producto",  sorted(df_det["Producto"].dropna().unique()),  key="cng_prod")
         f_ship  = fc2.multiselect(
-            "Shipper",  sorted(df_det["Shipper"].dropna().unique()),  key="cng_ship")
+            "Comprador", sorted(df_det["Comprador"].dropna().unique()), key="cng_ship")
         f_zona  = fc3.multiselect(
-            "Zona",     sorted(df_det["Zona"].dropna().unique()),     key="cng_zona")
+            "Zona",      sorted(df_det["Zona"].dropna().unique()),      key="cng_zona")
         f_dest  = fc4.multiselect(
-            "Destino",  sorted(df_det["Destino"].dropna().unique()),  key="cng_dest")
+            "Destino",   sorted(df_det["Destino"].dropna().unique()),   key="cng_dest")
 
         mask = pd.Series(True, index=df_det.index)
         if f_prod:  mask &= df_det["Producto"].isin(f_prod)
-        if f_ship:  mask &= df_det["Shipper"].isin(f_ship)
+        if f_ship:  mask &= df_det["Comprador"].isin(f_ship)
         if f_zona:  mask &= df_det["Zona"].isin(f_zona)
         if f_dest:  mask &= df_det["Destino"].isin(f_dest)
 
@@ -3309,7 +3452,7 @@ def _render_congestion_tab(fecha_ref):
     # Pronostico climatico 7 dias (4 zonas) via Open-Meteo
     # -------------------------------------------------------------------
     st.divider()
-    st.subheader("Pronostico 7 dias · zonas portuarias")
+    st.subheader("Pronóstico 7 días · zonas portuarias")
     st.caption(
         "Lluvia >5mm o rafaga >40km/h puede parar operaciones (elevadores "
         "no cargan bajo lluvia, puertos cierran con vientos fuertes). "
@@ -3381,7 +3524,7 @@ def _render_congestion_tab(fecha_ref):
                     )
 
 
-if _tab_sel == "⚓ CONGESTION":
+if _tab_sel == "⚓ CONGESTIÓN":
     _render_congestion_tab(fecha_ref)
 
 
@@ -3401,6 +3544,8 @@ _GRUPO_PRODUCTOS = {
     "Soja": {"SBS", "SBM", "SBO"},
     "Maíz": {"MAIZE"},
     "Trigo": {"WHEAT"},
+    "Cebada": {"BARLEY"},
+    "Sorgo": {"SORGHUM"},
 }
 
 

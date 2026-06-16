@@ -328,12 +328,14 @@ class TestDjvePorProductoRecientes(unittest.TestCase):
         self.assertEqual(row_sbs.iloc[0]["n_djve"], 2)
 
     def test_razon_social_top(self):
-        """El exportador top de SBS es VITERRA (10000 > 5000)."""
+        """El exportador top de SBS es VITERRA, canonicalizado a VITERRA-BUNGE."""
         df = fob_djve.djve_por_producto_recientes(
             self._df_base(), dias=30, hasta=date(2024, 3, 15)
         )
         row_sbs = df[df["codigo_interno"] == "SBS"]
-        self.assertEqual(row_sbs.iloc[0]["razon_social_top"], "VITERRA")
+        # La razon_social ahora se unifica con la normalizacion de shippers del
+        # line-up (VITERRA -> VITERRA-BUNGE), para cruzar ambos datasets.
+        self.assertEqual(row_sbs.iloc[0]["razon_social_top"], "VITERRA-BUNGE")
 
     def test_filtra_fuera_del_rango(self):
         """Registros fuera del rango no deben aparecer."""
