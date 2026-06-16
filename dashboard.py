@@ -540,9 +540,12 @@ def cached_fas_perfiles(fecha_ref: date) -> dict[tuple[str, str], dict]:
     # Extraer pares únicos del lineup de los últimos 90 días.
     from datetime import timedelta
     inicio_hist = fecha_ref - timedelta(days=90)
-    pares = set()
-    for _, row in df_lineup_hist[df_lineup_hist["cargo"].isin(fas_comprador.PRODUCTOS_FAS)].iterrows():
-        pares.add((row.get("shipper_canon", ""), row.get("cargo", "")))
+    pares = set(
+        df_lineup_hist[df_lineup_hist["cargo"].isin(fas_comprador.PRODUCTOS_FAS)]
+        [["shipper_canon", "cargo"]]
+        .drop_duplicates()
+        .itertuples(index=False, name=None)
+    )
     perfiles: dict[tuple[str, str], dict] = {}
     for shipper_canon, codigo_interno in pares:
         if not shipper_canon or not codigo_interno:
@@ -561,20 +564,52 @@ def cached_fas_perfiles(fecha_ref: date) -> dict[tuple[str, str], dict]:
 _MESA_PRODUCTOS = ["MAIZE", "WHEAT", "SOJA_CRUSH", "SBS"]
 
 
+# Indice {fecha_snap: sub_df} memoizado por identidad del master. El master
+# viene cacheado (mismo objeto durante el TTL), asi que indexamos una sola vez
+# y los cientos de _snapshot_lineup() posteriores son lookups O(1) en dict en
+# vez de un boolean-mask O(n) sobre todo el master cada vez.
+_SNAPSHOT_INDEX_CACHE: dict[int, dict[date, pd.DataFrame]] = {}
+
+
+def _indice_snapshots(master: pd.DataFrame) -> dict[date, pd.DataFrame]:
+    """Construye (o recupera memoizado) el dict {fecha_consulta: sub_df}."""
+    key = id(master)
+    cached = _SNAPSHOT_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    # Evitar fuga de memoria: el master rota cada dia, no acumulamos indices.
+    _SNAPSHOT_INDEX_CACHE.clear()
+    indice: dict[date, pd.DataFrame] = {}
+    if not master.empty:
+        if "fecha_day" in master.columns:
+            fechas = master["fecha_day"]
+        else:
+            fechas = pd.to_datetime(
+                master["fecha_consulta"], errors="coerce"
+            ).dt.date
+        for fecha, sub in master.groupby(fechas, observed=True):
+            if fecha is not None:
+                indice[fecha] = sub
+    _SNAPSHOT_INDEX_CACHE[key] = indice
+    return indice
+
+
 def _snapshot_lineup(master: pd.DataFrame, fecha_snap: date) -> pd.DataFrame:
     """Line-up tal como se vio en una fecha de consulta (snapshot exacto)."""
     if master.empty:
         return master
-    fechas = pd.to_datetime(master["fecha_consulta"], errors="coerce").dt.date
-    return master[fechas == fecha_snap].copy()
+    indice = _indice_snapshots(master)
+    sub = indice.get(fecha_snap)
+    if sub is None:
+        return master.iloc[0:0].copy()
+    return sub.copy()
 
 
 def _fechas_snapshot_disponibles(master: pd.DataFrame) -> list[date]:
     """Fechas de consulta únicas (snapshots) disponibles, ordenadas."""
     if master.empty:
         return []
-    fechas = pd.to_datetime(master["fecha_consulta"], errors="coerce").dt.date
-    return sorted({f for f in fechas if f is not None})
+    return sorted(_indice_snapshots(master).keys())
 
 
 def _anios_djve_historia(fecha_ref: date) -> tuple[int, ...]:
@@ -1333,7 +1368,12 @@ _render_senales_hoy()
 # Pestanas
 # ===========================================================================
 
-tab_mesa, tab_pan, tab_shp, tab_prd, tab_cng, tab_fas, tab_carga = st.tabs([
+# Selector de pestana persistido en session_state. A diferencia de st.tabs
+# (que renderiza el contenido de las 7 pestanas en cada rerun), aca renderizamos
+# SOLO la pestana seleccionada -> mucho menos trabajo por render. El estado de
+# los widgets internos de cada pestana sobrevive porque viven en session_state
+# por su `key`; solo se recalcula la pestana activa.
+_TABS = [
     "🔥 MESA",
     "📊 PANORAMA",
     "🏢 SHIPPERS",
@@ -1341,7 +1381,15 @@ tab_mesa, tab_pan, tab_shp, tab_prd, tab_cng, tab_fas, tab_carga = st.tabs([
     "⚓ CONGESTION",
     "🎯 COMPRADORES FAS",
     "📤 CARGA",
-])
+]
+_tab_sel = st.radio(
+    "Pestaña",
+    _TABS,
+    index=0,  # Default: MESA
+    horizontal=True,
+    label_visibility="collapsed",
+    key="tab_seleccionada",
+)
 
 
 # ==========================================================================
@@ -2554,13 +2602,13 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
 # archivo y la ejecucion de los tabs siga el orden visual del usuario.
 # ==========================================================================
 
-with tab_mesa:
+if _tab_sel == "🔥 MESA":
     _render_mesa_tab(fecha_ref)
 
-with tab_pan:
+if _tab_sel == "📊 PANORAMA":
     _render_panorama_tab(fecha_ref, ventana_dias)
 
-with tab_shp:
+if _tab_sel == "🏢 SHIPPERS":
     _render_shippers_tab(fecha_ref, ventana_dias)
 
 
@@ -3114,7 +3162,7 @@ def _render_productos_tab(fecha_ref):
                 )
 
 
-with tab_prd:
+if _tab_sel == "🌾 PRODUCTOS":
     _render_productos_tab(fecha_ref)
 
 
@@ -3312,7 +3360,7 @@ def _render_congestion_tab(fecha_ref):
                     )
 
 
-with tab_cng:
+if _tab_sel == "⚓ CONGESTION":
     _render_congestion_tab(fecha_ref)
 
 
@@ -3506,7 +3554,7 @@ def _render_fas_comprador_tab(fecha_ref: date) -> None:
 """)
 
 
-with tab_fas:
+if _tab_sel == "🎯 COMPRADORES FAS":
     _render_fas_comprador_tab(fecha_ref)
 
 
@@ -3639,7 +3687,7 @@ def _render_carga_compras_tab() -> None:
         cached_compras_fas.clear()
 
 
-with tab_carga:
+if _tab_sel == "📤 CARGA":
     _render_carga_compras_tab()
 
 

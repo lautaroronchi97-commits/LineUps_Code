@@ -58,6 +58,10 @@ RATIO_SOBRE_ORIGEN = 1.3  # ratio > 1.3 -> compraron de mas -> BAJISTA
 # Calibrado a Gran Rosario: ~6 Panamax (60k c/u) cargando la misma semana.
 CONGESTION_TN_SEMANA = 360_000.0
 
+# Memo {(id(df), len(df)): (shipper_canon_list, origen_alt_list)} para no
+# re-canonicalizar la misma DJVE en cada balance (ver canonicalizar_djve).
+_CANON_DJVE_CACHE: dict[tuple[int, int], tuple[list, list]] = {}
+
 
 # ---------------------------------------------------------------------------
 # 1. Canonicalizacion de la razon social DJVE
@@ -82,22 +86,41 @@ def canonicalizar_djve(df_djve: pd.DataFrame) -> pd.DataFrame:
         Si el DataFrame esta vacio o no tiene `razon_social`, devuelve una copia
         con esas columnas en None.
     """
-    df = df_djve.copy()
-    if df.empty or "razon_social" not in df.columns:
+    if df_djve.empty or "razon_social" not in df_djve.columns:
+        df = df_djve.copy()
         df["shipper_canon"] = None
         df["origen_alt"] = None
         return df
 
-    # Optimizacion: canonicalizamos solo los valores unicos de razon_social y
-    # mapeamos de vuelta (la regex es cara y hay muchas filas con la misma
-    # razon social). Salida identica al .map() por fila.
-    serie = df["razon_social"]
-    uniques = serie.dropna().unique()
-    lut = {u: canonicalizar_shipper(u) for u in uniques}
-    fallback = ("OTROS", None)
-    pares = [lut.get(v, fallback) for v in serie]
-    df["shipper_canon"] = [p[0] for p in pares]
-    df["origen_alt"] = [p[1] for p in pares]
+    # Memo de las columnas derivadas por identidad del DataFrame de entrada.
+    # balance_por_shipper / perfil_historico canonicalizan la MISMA DJVE muchas
+    # veces (3 horizontes, 12 semanas...). Cacheamos shipper_canon/origen_alt
+    # para el mismo objeto y largo, y solo reconstruimos la copia (barata).
+    # Devolvemos siempre una copia nueva, asi ningun caller mutua el cache.
+    _rs = df_djve["razon_social"]
+    key = (
+        id(df_djve), len(df_djve),
+        _rs.iat[0] if len(_rs) else None,
+        _rs.iat[-1] if len(_rs) else None,
+    )
+    cached = _CANON_DJVE_CACHE.get(key)
+    if cached is None:
+        # Optimizacion: canonicalizamos solo los valores unicos de razon_social
+        # y mapeamos de vuelta (la regex es cara y hay muchas filas con la misma
+        # razon social). Salida identica al .map() por fila.
+        serie = df_djve["razon_social"]
+        uniques = serie.dropna().unique()
+        lut = {u: canonicalizar_shipper(u) for u in uniques}
+        fallback = ("OTROS", None)
+        pares = [lut.get(v, fallback) for v in serie]
+        cached = ([p[0] for p in pares], [p[1] for p in pares])
+        # Evitar fuga: solo guardamos el ultimo DataFrame canonicalizado.
+        _CANON_DJVE_CACHE.clear()
+        _CANON_DJVE_CACHE[key] = cached
+
+    df = df_djve.copy()
+    df["shipper_canon"] = cached[0]
+    df["origen_alt"] = cached[1]
     return df
 
 

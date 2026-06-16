@@ -341,6 +341,12 @@ def query_exports_prioritarios(
     if "quantity" in df.columns:
         df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").astype("float32")
 
+    # Columna fecha_day (date) pre-tipada UNA vez: el dashboard hace cientos de
+    # lookups de "snapshot del dia X" sobre el master; tenerla lista evita
+    # reconvertir fecha_consulta en cada lookup.
+    if "fecha_consulta" in df.columns:
+        df["fecha_day"] = pd.to_datetime(df["fecha_consulta"], errors="coerce").dt.date
+
     return df
 
 

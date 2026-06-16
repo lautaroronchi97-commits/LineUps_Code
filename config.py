@@ -377,8 +377,17 @@ TABLA_LINEUP = "lineup"
 # Upsert en lotes de 500 filas para evitar timeouts del API de Supabase.
 UPSERT_BATCH_SIZE = 500
 
-# Paginacion: Supabase devuelve max 1000 filas por query. Este es el tamano
-# de cada "pagina" cuando traemos data historica.
+# Paginacion: tamano de cada "pagina" al traer data historica.
+#
+# TODO (perf, requiere verificacion server-side): subir a 5000 reduciria los
+# round-trips ~5x en el cold start del master (cientos de miles de filas). PERO
+# `_fetch_all` corta la paginacion cuando un batch devuelve MENOS de
+# FETCH_PAGE_SIZE filas; si el `max-rows` de PostgREST en el proyecto Supabase
+# sigue en 1000 (default historico), pedir 5000 devolveria 1000 < 5000 en la
+# primera pagina -> el loop cortaria y PERDERIA datos silenciosamente. No se
+# puede verificar el `max-rows` real desde este entorno (sin credenciales), asi
+# que se deja en 1000 (seguro). Para subirlo: confirmar en Supabase Dashboard
+# > Settings > API que `max-rows` >= 5000, recien ahi cambiar este valor.
 FETCH_PAGE_SIZE = 1000
 
 # Clave unica logica usada en el upsert para evitar duplicados.
