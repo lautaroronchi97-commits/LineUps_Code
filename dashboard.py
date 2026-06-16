@@ -39,7 +39,8 @@ import streamlit as st
 # Solo cargamos URL y ANON_KEY desde st.secrets.
 # La SERVICE_ROLE_KEY NO debe estar en secrets del dashboard (usa solo anon_key).
 # Si alguien la agrego por error, fallamos rapido con un mensaje claro.
-for _nombre_secret in ("SUPABASE_URL", "SUPABASE_ANON_KEY"):
+# CARGA_PASSWORD (opcional): si esta definida, protege la pestana CARGA con clave.
+for _nombre_secret in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "CARGA_PASSWORD"):
     try:
         _valor = st.secrets[_nombre_secret]
         if isinstance(_valor, str):
@@ -3507,12 +3508,55 @@ with tab_fas:
 # Pestaña CARGA: carga manual de compras MAGyP
 # ===========================================================================
 
+def _carga_autorizada() -> bool:
+    """
+    Controla el acceso a la pestaña CARGA con una contraseña opcional.
+
+    - Si CARGA_PASSWORD NO está configurada → acceso abierto (devuelve True),
+      con un aviso de que conviene protegerla.
+    - Si está configurada → pide la clave y la recuerda en la sesión.
+
+    Devuelve True si el usuario puede operar el panel de carga.
+    """
+    password_real = os.getenv("CARGA_PASSWORD", "").strip()
+
+    if not password_real:
+        st.info(
+            "🔓 Carga **sin contraseña**: cualquiera con el link puede subir datos. "
+            "Para protegerla, definí `CARGA_PASSWORD` en los secrets de Streamlit "
+            "(o en `.env` local)."
+        )
+        return True
+
+    if st.session_state.get("carga_autenticado"):
+        return True
+
+    st.markdown("🔒 **Panel protegido.** Ingresá la contraseña para cargar datos.")
+    intento = st.text_input(
+        "Contraseña", type="password", key="carga_password_input",
+    )
+    if not intento:
+        return False
+
+    # compare_digest evita filtrar la longitud/contenido por timing.
+    import hmac
+    if hmac.compare_digest(intento, password_real):
+        st.session_state["carga_autenticado"] = True
+        st.rerun()
+    else:
+        st.error("Contraseña incorrecta.")
+    return False
+
+
 def _render_carga_compras_tab() -> None:
     st.subheader("📤 Carga de Comercialización MAGyP")
     st.caption(
         "Subí el archivo semanal de compras (SIO-Granos) para actualizar la base. "
         "La carga escribe en la tabla `compras` vía RLS pública."
     )
+
+    if not _carga_autorizada():
+        return
 
     st.markdown(
         "**Dónde bajar el archivo:** "
