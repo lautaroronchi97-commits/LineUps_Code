@@ -3559,10 +3559,15 @@ def _render_carga_compras_tab() -> None:
         return
 
     st.markdown(
-        "**Dónde bajar el archivo:** "
-        "[datos.magyp.gob.ar → Comercialización de Granos](https://datos.magyp.gob.ar/dataset/compras-de-granos) "
-        "→ descargar el CSV o XLSX más reciente desde tu navegador (Argentina)."
+        "**Paso 1 —** Abrí el MAGyP y descargá el CSV o XLSX más reciente "
+        "de _Comercialización de Granos_ (desde tu navegador en Argentina):"
     )
+    st.link_button(
+        "🔗 Abrir MAGyP — Comercialización de Granos",
+        "https://datos.magyp.gob.ar/dataset/compras-de-granos",
+        use_container_width=True,
+    )
+    st.markdown("**Paso 2 —** Subí acá el archivo descargado:")
     st.divider()
 
     uploaded = st.file_uploader(
