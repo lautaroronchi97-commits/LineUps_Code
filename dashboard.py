@@ -1349,7 +1349,7 @@ def _render_senales_hoy():
                 alertas_success.append(
                     f"🚢 **Buque nuevo grande** · {_row['vessel']} · "
                     f"{_row.get('cargo','?')} · {_qty_fmt} · "
-                    f"Shipper: {_shp} · Puerto: {_row.get('port','?')}"
+                    f"Comprador: {_shp} · Puerto: {_row.get('port','?')}"
                 )
 
     # ---- Alerta: z-score de shippers (usando calc ya existente) ----
@@ -2272,13 +2272,13 @@ def _render_panorama_tab(fecha_ref, ventana_dias):
             "Producto":       display,
             "Cargando":       b_cargando,
             "Arribando":      b_arribando,
-            "Tons hoy":       fmt_tons(tons_p_hoy),
+            "Toneladas hoy":  fmt_tons(tons_p_hoy),
             f"Prom {ventana_dias}d": fmt_tons(tons_p_prom),
             "vs prom":        pct_change(tons_p_hoy, tons_p_prom),
             "Δ sem":          pct_change(tons_sem_act, tons_sem_ant),
-            "Top shipper":    top_ship,
-            "Top destino":    top_dest,
-            "Campana":        camp_actual,
+            "Comprador top":  top_ship,
+            "Destino top":    top_dest,
+            "Campaña":        camp_actual,
             # Columna interna para ordenar por valor numerico real, ya que la
             # columna "Tons hoy" esta formateada como string ("46K").
             "_tons_hoy_raw":  float(tons_p_hoy or 0),
@@ -2304,8 +2304,8 @@ def _render_panorama_tab(fecha_ref, ventana_dias):
 
     st.divider()
 
-    # ------------------- Heatmap puerto x producto -------------------
-    st.subheader(f"Heatmap · puerto × producto · {fecha_ref}")
+    # ------------------- Mapa de calor puerto x producto -------------------
+    st.subheader(f"Mapa de calor · puerto × producto · {fecha_ref}")
 
     if df_hoy.empty:
         st.info("Sin data para hoy.")
@@ -2326,7 +2326,7 @@ def _render_panorama_tab(fecha_ref, ventana_dias):
                     [0.5, BLOOMBERG_PALETTE["accent_blue"]],
                     [1.0, BLOOMBERG_PALETTE["accent"]],
                 ],
-                labels={"color": "Tons"},
+                labels={"color": "Toneladas"},
             )
             aplicar_tema(fig_hm)
             fig_hm.update_layout(height=max(300, 40 + 22 * len(pivot)))
@@ -2361,7 +2361,7 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     df_shp_vent = df_shp_vent[df_shp_vent["fecha_consulta"] == _ult_foto_shp]
 
     # ------------------- Ranking por shipper en la ventana -------------------
-    st.subheader(f"Ranking top 10 · ultimos {ventana_dias} dias")
+    st.subheader(f"Ranking de compradores · últimos {ventana_dias} días")
 
     # Agregado ventana.
     # Solo compradores diferenciados; "OTROS" no se lista (pedido del usuario).
@@ -2411,9 +2411,9 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     )
 
     st.caption(
-        "Senal basada en z-score del conteo de buques propios contra ultimos "
-        "2 anos del mismo shipper. 🔥 = z≥2 (mas barcos que lo normal, senal "
-        "de trade). 🔴 = z≤-2 (muy por debajo de su media historica)."
+        "Señal basada en z-score del conteo de buques propios contra los últimos "
+        "2 años del mismo comprador. 🔥 = z≥2 (más barcos que lo normal, señal "
+        "de compra). 🔴 = z≤-2 (muy por debajo de su media histórica)."
     )
 
     st.divider()
@@ -2422,7 +2422,7 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.caption(f"Toneladas por shipper · ultimos {ventana_dias}d")
+        st.caption(f"Toneladas por comprador · últimos {ventana_dias}d")
         agg_tons = (
             df_shp_vent.groupby("shipper_canon")["quantity"].sum()
             .reset_index()
@@ -2481,7 +2481,7 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     # embarco mas TONELADAS hoy. Esta tabla responde: cuanto tonelaje cargo
     # cada shipper en los ultimos 3 meses, y como se compara contra el mes
     # anterior (Δ MoM) y contra el mismo mes hace 12 meses (Δ YoY).
-    st.subheader("Actividad mensual top 10 · ultimos 3 meses")
+    st.subheader("Actividad mensual top 10 · últimos 3 meses")
     st.caption(
         "Toneladas por shipper en los ultimos 3 meses. Δ MoM = variacion vs "
         "mes anterior. Δ YoY = variacion vs mismo mes hace 12 meses."
@@ -2591,9 +2591,9 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     st.divider()
 
     # ------------------- Drill-down: shipper seleccionado -------------------
-    st.subheader("Drill-down por shipper")
+    st.subheader("Detalle por comprador")
     shipper_sel = st.selectbox(
-        "Seleccionar shipper",
+        "Seleccionar comprador",
         options=SHIPPERS_TOP,
         index=0,
     )
@@ -2805,7 +2805,7 @@ def _render_productos_tab(fecha_ref):
         st.divider()
 
         # ------------------- Chart principal: campana actual vs historicas -------------------
-        st.subheader(f"Cargamento acumulado · dia-de-campana (vs ultimas 5)")
+        st.subheader(f"Cargamento acumulado · día-de-campaña (vs últimas 5)")
 
         # Construir serie acumulada por campana.
         series_por_camp = {}
@@ -2894,18 +2894,18 @@ def _render_productos_tab(fecha_ref):
             tons = sub["quantity"].fillna(0).sum()
             buques = sub["vessel"].nunique()
             tabla_cmp.append({
-                "Campana": camp,
+                "Campaña": camp,
                 "Buques":  buques,
-                "Tons":    fmt_tons(tons),
-                "Tons_raw": tons,  # para ordenar
+                "Toneladas": fmt_tons(tons),
+                "_tons_raw": tons,  # para ordenar
             })
         df_cmp = pd.DataFrame(tabla_cmp)
-        df_cmp = df_cmp.sort_values("Campana", ascending=False)
+        df_cmp = df_cmp.sort_values("Campaña", ascending=False)
         st.dataframe(
-            df_cmp.drop(columns=["Tons_raw"]),
+            df_cmp.drop(columns=["_tons_raw"]),
             use_container_width=True, hide_index=True,
         )
-        _csv_productos = df_cmp.drop(columns=["Tons_raw"]).to_csv(index=False).encode("utf-8")
+        _csv_productos = df_cmp.drop(columns=["_tons_raw"]).to_csv(index=False).encode("utf-8")
         st.download_button(
             label="⬇ Descargar CSV",
             data=_csv_productos,
@@ -2948,11 +2948,11 @@ def _render_productos_tab(fecha_ref):
 
                 if not fila.empty:
                     k1, k2, k3 = st.columns(3)
-                    k1.metric("DJVE ultimos 30d (tons)",
+                    k1.metric("DJVE últimos 30d (ton)",
                               fmt_tons(fila.iloc[0]["toneladas"]))
                     k2.metric("N° de declaraciones",
                               int(fila.iloc[0]["n_djve"]))
-                    k3.metric("Top exportador",
+                    k3.metric("Comprador top",
                               fila.iloc[0]["razon_social_top"][:25])
 
                 # Chart: barras diarias.
@@ -3093,7 +3093,7 @@ def _render_productos_tab(fecha_ref):
 
         # ------------------- Top shippers de este producto -------------------
         st.divider()
-        st.subheader(f"Top shippers de {display_prd} · campana {campana_actual}")
+        st.subheader(f"Top compradores de {display_prd} · campaña {campana_actual}")
         top_shp = (
             df_actual.groupby("shipper_canon")["quantity"].sum()
             .sort_values(ascending=True).reset_index()
@@ -3113,7 +3113,7 @@ def _render_productos_tab(fecha_ref):
 
         # ------------------- Estimaciones MAGyP: contexto macro ---------------
         st.divider()
-        st.subheader(f"Produccion historica · {display_prd} (MAGyP)")
+        st.subheader(f"Producción histórica · {display_prd} (MAGyP)")
         st.caption(
             "Estimaciones oficiales MAGyP por campana cerrada. "
             "Util para dimensionar el line-up contra produccion real. "
@@ -3342,7 +3342,7 @@ def _render_congestion_tab(fecha_ref):
     # Pronostico climatico 7 dias (4 zonas) via Open-Meteo
     # -------------------------------------------------------------------
     st.divider()
-    st.subheader("Pronostico 7 dias · zonas portuarias")
+    st.subheader("Pronóstico 7 días · zonas portuarias")
     st.caption(
         "Lluvia >5mm o rafaga >40km/h puede parar operaciones (elevadores "
         "no cargan bajo lluvia, puertos cierran con vientos fuertes). "
