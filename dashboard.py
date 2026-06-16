@@ -367,6 +367,19 @@ st.markdown(
 # Cached queries
 # ===========================================================================
 
+# TODO (fase 3, perf server-side, NO aplicado): los 4 metadatos iniciales
+# (cached_ping, cached_ultima_fecha, cached_primera_fecha,
+# cached_ultima_actualizacion) hacen 4 round-trips separados a Supabase en el
+# cold start. Se podrian combinar en UNA sola RPC server-side, p.ej.:
+#   create function dashboard_meta() returns json language sql as $$
+#     select json_build_object(
+#       'cantidad', (select reltuples::bigint from pg_class where relname='lineup'),
+#       'ultima_fecha', (select max(fecha_consulta) from lineup),
+#       'primera_fecha', (select min(fecha_consulta) from lineup),
+#       'ultima_actualizacion', (select max(created_at) from lineup));
+#   $$;
+# y leerla con client.rpc("dashboard_meta"). No se implementa porque requiere
+# crear la function en Supabase (SQL server-side), imposible desde este entorno.
 @st.cache_data(ttl=900, show_spinner="Consultando base...")
 def cached_ping() -> dict:
     return ping()
@@ -424,6 +437,14 @@ def cached_serie_diaria_hist(desde: date, hasta: date) -> pd.DataFrame:
     """
     Serie diaria agregada (tons agro LOAD) entre [desde, hasta], derivada
     del master cache. No toca la DB.
+
+    TODO (fase 3, perf server-side, NO aplicado): para datasets muy grandes,
+    esta agregacion diaria seria mas barata como RPC/SQL en Supabase
+    (SELECT fecha_consulta::date, SUM(quantity) ... WHERE ops='LOAD' GROUP BY 1),
+    evitando traer todas las filas crudas al cliente. No se implementa porque
+    requiere crear/ejecutar SQL server-side en Supabase, que no es posible desde
+    este entorno (sin credenciales). En el cliente ya esta optimizado: deriva del
+    master cacheado (sin roundtrip por dia) y agrega con un unico groupby.
     """
     df = cached_master_exports(cached_ultima_fecha() or hasta)
     if df.empty:

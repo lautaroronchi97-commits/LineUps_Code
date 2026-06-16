@@ -154,6 +154,19 @@ def _fetch_all(query_builder) -> list[dict[str, Any]]:
 
     Corta en _FETCH_MAX_ROWS como circuit breaker ante crecimiento inesperado
     de la tabla (bug de dedup, ingesta accidental de duplicados masivos).
+
+    TODO (fase 3, perf, NO aplicado por riesgo): paginacion paralela con
+    ThreadPoolExecutor (primero un count("planned"), luego cada .range() en un
+    thread). Reduciria el cold start del master proporcionalmente al numero de
+    paginas. No se aplica aca porque:
+      1. Los builders de supabase-py son de un solo uso y no son thread-safe;
+         habria que reconstruir el query por pagina (mas invasivo).
+      2. Sin DB real en este entorno no se puede validar que el orden global
+         (.order(...)) y los limites de rate del API se mantengan correctos.
+      3. Riesgo de respuestas parciales/errores transitorios mas dificiles de
+         depurar que la version secuencial.
+    Recomendacion: implementarlo detras de un flag, con count previo y reensamble
+    ordenado por offset, y probarlo contra el proyecto Supabase real.
     """
     filas: list[dict[str, Any]] = []
     inicio = 0
