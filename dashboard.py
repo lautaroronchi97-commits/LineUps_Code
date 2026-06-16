@@ -97,6 +97,7 @@ from db import (
 )
 import cargar_compras as _cargar_compras_mod
 from shipper_norm import SHIPPERS_TOP, aplicar_a_dataframe
+import compras_fas
 import fas_comprador
 
 # ===========================================================================
@@ -586,6 +587,22 @@ def cached_fas_perfiles(fecha_ref: date) -> dict[tuple[str, str], dict]:
             df_lineup_hist, shipper_canon, codigo_interno, df_djve_hist, fecha_ref
         )
     return perfiles
+
+
+@st.cache_data(ttl=900, show_spinner="Calculando posición de la exportación...")
+def cached_posicion_exportadora(fecha_ref: date, horizonte_dias: int = 60) -> pd.DataFrame:
+    """
+    Posición declarado (DJVE) vs comprado (FAS/MAGyP) vs embarcado (line-up)
+    por producto, para la sección "Posición de la exportación" de la pestaña
+    PRODUCTOS. Responde directamente "¿está comprada/vendida la exportación?"
+    y "¿hay mucho [producto] para embarcar y poco comprado?".
+    """
+    df_lineup = cached_master_exports(cached_ultima_fecha() or fecha_ref)
+    df_djve = cached_djve(fecha_ref.year)
+    df_compras = cached_compras_fas()
+    return compras_fas.posicion_exportadora(
+        df_djve, df_compras, df_lineup, fecha_ref, horizonte_dias
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2669,6 +2686,96 @@ if _tab_sel == "🏢 COMPRADORES":
 # PESTANA 3: PRODUCTOS (vista por producto con comparacion de campanas)
 # ==========================================================================
 
+_SEÑAL_PRESION_COLOR = {
+    "PRESION COMPRADORA": BLOOMBERG_PALETTE["negative"],
+    "PRESION VENDEDORA": BLOOMBERG_PALETTE["positive"],
+    "CORTO_EMBARQUE": BLOOMBERG_PALETTE["warning"],
+}
+_SEÑAL_PRESION_EMOJI = {
+    "PRESION COMPRADORA": "🔴",
+    "PRESION VENDEDORA": "🟢",
+    "CORTO_EMBARQUE": "🟡",
+}
+
+
+def _render_posicion_exportadora(fecha_ref: date) -> None:
+    """
+    Posición de la exportación por producto: declarado (DJVE) vs comprado
+    (FAS/MAGyP) vs embarcado (line-up). Responde "¿la exportación está
+    comprada/vendida?" y "¿hay mucho [producto] para embarcar y poco
+    comprado?" (preguntas del vendedor FAS que no cubría ninguna pestaña).
+    """
+    st.markdown("### 📐 Posición de la exportación")
+    st.caption(
+        "Declarado (DJVE) vs comprado (FAS/MAGyP) vs embarcado (line-up) — "
+        "ventana de 60 días. Faltante de compra > 0 = la expo está corta y "
+        "debe salir a comprar al FAS → presión alcista para el vendedor."
+    )
+
+    posicion = cached_posicion_exportadora(fecha_ref)
+    if posicion.empty:
+        st.info("Sin datos suficientes de DJVE para calcular la posición.")
+        return
+
+    señales = compras_fas.senales_presion(posicion)
+    mapa_señal = {row["codigo_interno"]: row for _, row in señales.iterrows()}
+
+    display = posicion.copy()
+    display["señal"] = display["codigo_interno"].map(
+        lambda c: mapa_señal.get(c, {}).get("senal", "NEUTRAL")
+    )
+
+    def _fmt_señal(s: str) -> str:
+        return f"{_SEÑAL_PRESION_EMOJI.get(s, '⚪')} {s.replace('_', ' ')}"
+
+    tabla = display[[
+        "producto_display", "declarado_tn", "comprado_tn", "embarcado_tn",
+        "falta_comprar_tn", "ratio_compra", "ratio_embarque", "señal",
+    ]].rename(columns={
+        "producto_display": "Producto",
+        "declarado_tn": "Declarado (tn)",
+        "comprado_tn": "Comprado (tn)",
+        "embarcado_tn": "Embarcado (tn)",
+        "falta_comprar_tn": "Falta comprar (tn)",
+        "ratio_compra": "Cobertura compra",
+        "ratio_embarque": "Cobertura embarque",
+        "señal": "Señal",
+    })
+    for col_tn in ("Declarado (tn)", "Comprado (tn)", "Embarcado (tn)", "Falta comprar (tn)"):
+        tabla[col_tn] = tabla[col_tn].apply(
+            lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+        )
+    for col_pct in ("Cobertura compra", "Cobertura embarque"):
+        tabla[col_pct] = tabla[col_pct].apply(
+            lambda v: f"{v:.0%}" if pd.notna(v) else "—"
+        )
+    tabla["Señal"] = tabla["Señal"].apply(_fmt_señal)
+
+    st.dataframe(tabla, use_container_width=True, hide_index=True)
+
+    if not señales.empty:
+        st.markdown("##### Racional de las señales activas")
+        for _, row in señales.iterrows():
+            emoji = _SEÑAL_PRESION_EMOJI.get(row["senal"], "⚪")
+            st.markdown(
+                f"{emoji} **{row['producto_display']} · {row['senal'].replace('_', ' ')}** "
+                f"(intensidad {row['intensidad']}/5) — {row['racional']}"
+            )
+
+    with st.expander("ℹ️ Metodología"):
+        st.markdown("""
+**Declarado** = DJVE con ventana de embarque solapando los próximos 60 días.
+**Comprado** = compras de la exportación (SIO-Granos/MAGyP) acumuladas en la campaña vigente —
+si la tabla `compras` está vacía, esta columna y la señal de compra quedan en blanco.
+**Embarcado** = buques con ETB en los próximos 60 días (line-up).
+
+- **Falta comprar** = Declarado − Comprado. Si es alto y positivo, la expo está corta en el FAS.
+- 🔴 **PRESION COMPRADORA**: cobertura de compra < 80% → debe salir a comprar, sesgo alcista para el vendedor.
+- 🟢 **PRESION VENDEDORA**: cobertura de compra > 125% → expo larga, puede bajar el bid.
+- 🟡 **CORTO EMBARQUE**: sin dato de compras FAS pero cobertura de embarque < 70% (proxy de posición corta).
+""")
+
+
 @st.fragment
 def _render_productos_tab(fecha_ref):
     """
@@ -2677,6 +2784,9 @@ def _render_productos_tab(fecha_ref):
     del dashboard (Panorama, Shippers, Congestion) NO se vuelve a calcular.
     Sin esto, cambiar producto re-disparaba todo el script y la UI se tildaba.
     """
+    _render_posicion_exportadora(fecha_ref)
+    st.divider()
+
     col_sel, col_info = st.columns([1, 3])
     with col_sel:
         opciones = [(codigo, display) for codigo, display, _ in PRODUCTOS_PRIORITARIOS]
