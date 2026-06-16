@@ -302,9 +302,8 @@ def balance_por_producto(
 
     df["falta_cubrir_tn"] = df["declarado_tn"] - df["originado_tn"]
     df["ratio_cobertura"] = _ratio_vec(df["originado_tn"], df["declarado_tn"])
-    df["producto_display"] = df["codigo_interno"].map(
-        config.PRODUCTO_DISPLAY
-    ).fillna(df["codigo_interno"])
+    _ci = df["codigo_interno"].astype(str)
+    df["producto_display"] = _ci.map(config.PRODUCTO_DISPLAY).fillna(_ci)
 
     df = df[
         [
@@ -385,9 +384,8 @@ def balance_por_shipper(
 
     df["falta_cubrir_tn"] = df["declarado_tn"] - df["originado_tn"]
     df["ratio_cobertura"] = _ratio_vec(df["originado_tn"], df["declarado_tn"])
-    df["producto_display"] = df["codigo_interno"].map(
-        config.PRODUCTO_DISPLAY
-    ).fillna(df["codigo_interno"])
+    _ci = df["codigo_interno"].astype(str)
+    df["producto_display"] = _ci.map(config.PRODUCTO_DISPLAY).fillna(_ci)
 
     df = df[
         [
