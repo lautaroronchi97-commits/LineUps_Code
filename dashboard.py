@@ -81,7 +81,8 @@ from config import (
     PRODUCTO_DISPLAY,
     PRODUCTOS_PRIORITARIOS,
     SHIPPER_COLORS,
-    zona_de_puerto,
+    colapsar_producto,
+    zona_carga,
 )
 from db import (
     ping,
@@ -480,9 +481,18 @@ def cached_en_puerto_ahora(fecha: date) -> pd.DataFrame:
     df = query_en_puerto_ahora(fecha)
     if df.empty:
         return df
+    # Solo carga (LOAD) y solo los productos prioritarios (con colapso SHULLS->SBM).
+    if "ops" in df.columns:
+        df = df[df["ops"] == "LOAD"].copy()
+    if "cargo" in df.columns:
+        df["cargo"] = df["cargo"].map(colapsar_producto)
+        df = df[df["cargo"].isin(CODIGOS_PRIORITARIOS)].copy()
+    if df.empty:
+        return df
     df = aplicar_a_dataframe(df)
-    mapa_zona = {p: zona_de_puerto(p) for p in df["port"].unique()}
-    df["zona"] = df["port"].map(mapa_zona)
+    df["zona"] = [
+        zona_carga(p, b) for p, b in zip(df["port"], df.get("berth", df["port"]))
+    ]
     return df
 
 
@@ -521,8 +531,9 @@ def cached_serie_congestion(desde: date, hasta: date) -> pd.DataFrame:
     if df_ep.empty:
         return pd.DataFrame()
 
-    mapa_zona = {p: zona_de_puerto(p) for p in df_ep["port"].unique()}
-    df_ep["zona"] = df_ep["port"].map(mapa_zona)
+    df_ep["zona"] = [
+        zona_carga(p, b) for p, b in zip(df_ep["port"], df_ep.get("berth", df_ep["port"]))
+    ]
     return (
         df_ep.groupby(["fecha", "zona"])["vessel"]
         .nunique().reset_index(name="buques")
@@ -1397,9 +1408,9 @@ _render_senales_hoy()
 _TABS = [
     "🔥 MESA",
     "📊 PANORAMA",
-    "🏢 SHIPPERS",
+    "🏢 COMPRADORES",
     "🌾 PRODUCTOS",
-    "⚓ CONGESTION",
+    "⚓ CONGESTIÓN",
     "🎯 COMPRADORES FAS",
     "📤 CARGA",
 ]
@@ -1783,16 +1794,20 @@ def _render_mesa_zonas(fecha_ref: date, snap_hoy: date) -> None:
     snapshots = _fechas_snapshot_disponibles(master)
 
     zonas = {
-        "UP-RIVER ROSARIO": ("Gran Rosario Norte", "Gran Rosario Sur"),
+        "UP RIVER NORTE": ("Up River Norte",),
+        "UP RIVER SUR": ("Up River Sur",),
         "BAHÍA BLANCA": ("Bahia Blanca",),
         "QUEQUÉN": ("Necochea/Quequen",),
     }
     productos = ["MAIZE", "WHEAT", "SOJA_CRUSH"]
-    cols = st.columns(3)
+    cols = st.columns(4)
 
     if not lineup_hoy.empty:
         lineup_hoy = lineup_hoy.copy()
-        lineup_hoy["_zona"] = lineup_hoy["port"].map(zona_de_puerto)
+        lineup_hoy["_zona"] = [
+            zona_carga(p, b)
+            for p, b in zip(lineup_hoy["port"], lineup_hoy.get("berth", lineup_hoy["port"]))
+        ]
 
     for col, (zona_label, zona_keys) in zip(cols, zonas.items()):
         with col:
@@ -1892,7 +1907,10 @@ def _pctl_tonelaje_zona(master, zona_keys, codigos, prod, fecha_ref,
     lineup_hoy = _snapshot_lineup(master, snap_hoy)
     if not lineup_hoy.empty:
         lineup_hoy = lineup_hoy.copy()
-        lineup_hoy["_zona"] = lineup_hoy["port"].map(zona_de_puerto)
+        lineup_hoy["_zona"] = [
+            zona_carga(p, b)
+            for p, b in zip(lineup_hoy["port"], lineup_hoy.get("berth", lineup_hoy["port"]))
+        ]
         lineup_hoy = lineup_hoy[lineup_hoy["_zona"].isin(zona_keys)]
     ton_hoy = _tonelaje_zona(lineup_hoy, codigos, snap_hoy)
 
@@ -1905,7 +1923,10 @@ def _pctl_tonelaje_zona(master, zona_keys, codigos, prod, fecha_ref,
             if ld.empty:
                 continue
             ld = ld.copy()
-            ld["_zona"] = ld["port"].map(zona_de_puerto)
+            ld["_zona"] = [
+                zona_carga(p, b)
+                for p, b in zip(ld["port"], ld.get("berth", ld["port"]))
+            ]
             ld = ld[ld["_zona"].isin(zona_keys)]
             registros.append((snap, prod, _tonelaje_zona(ld, codigos, snap)))
     serie = estacional.construir_serie(registros)
@@ -2343,10 +2364,11 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     st.subheader(f"Ranking top 10 · ultimos {ventana_dias} dias")
 
     # Agregado ventana.
+    # Solo compradores diferenciados; "OTROS" no se lista (pedido del usuario).
     agg_vent = (
         df_shp_vent.groupby("shipper_canon")
         .agg(buques=("vessel", "nunique"), tons=("quantity", "sum"))
-        .reindex(SHIPPERS_TOP + ["OTROS"], fill_value=0)
+        .reindex(SHIPPERS_TOP, fill_value=0)
         .reset_index()
         .rename(columns={"shipper_canon": "Shipper"})
     )
@@ -2365,13 +2387,17 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     df_senales["Tons"] = df_senales["tons"].apply(fmt_tons)
     df_senales = df_senales.drop(columns=["tons"])
     df_senales = df_senales.sort_values("Z-score", ascending=False)
+    df_senales = df_senales.rename(columns={
+        "Shipper": "Comprador", "Senal": "Señal", "Tons": "Toneladas",
+        "Buques (vent)": "Buques (vent.)",
+    })
 
     st.dataframe(
         df_senales,
         use_container_width=True,
         hide_index=True,
         column_order=[
-            "Shipper", "Senal", "Buques (vent)", "Media hist.", "σ", "Z-score", "Tons",
+            "Comprador", "Señal", "Buques (vent.)", "Media hist.", "σ", "Z-score", "Toneladas",
         ],
         height=420,
     )
@@ -2402,7 +2428,10 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
             .reset_index()
             .rename(columns={"shipper_canon": "Shipper", "quantity": "Tons"})
         )
-        agg_tons = agg_tons[agg_tons["Tons"] > 0].sort_values("Tons", ascending=True)
+        # Ocultar "OTROS": solo compradores diferenciados.
+        agg_tons = agg_tons[
+            (agg_tons["Tons"] > 0) & (agg_tons["Shipper"] != "OTROS")
+        ].sort_values("Tons", ascending=True)
         colors = [SHIPPER_COLORS.get(s, SHIPPER_COLORS["OTROS"]) for s in agg_tons["Shipper"]]
 
         fig_tons = go.Figure()
@@ -2468,7 +2497,10 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
             reverse=True,
         )
         fmc1, fmc2 = st.columns(2)
-        f_prod_mes = fmc1.selectbox("Producto", _prod_opts, key="shp_mes_prod")
+        f_prod_mes = fmc1.selectbox(
+            "Producto", _prod_opts, key="shp_mes_prod",
+            format_func=lambda c: "Todos" if c == "Todos" else PRODUCTO_DISPLAY.get(c, c),
+        )
         f_camp_mes = fmc2.selectbox("Cosecha", _camp_opts_shp, key="shp_mes_camp")
 
     hoy_per_shp = pd.Period(fecha_ref, freq="M")
@@ -2629,7 +2661,7 @@ if _tab_sel == "🔥 MESA":
 if _tab_sel == "📊 PANORAMA":
     _render_panorama_tab(fecha_ref, ventana_dias)
 
-if _tab_sel == "🏢 SHIPPERS":
+if _tab_sel == "🏢 COMPRADORES":
     _render_shippers_tab(fecha_ref, ventana_dias)
 
 
@@ -3232,34 +3264,35 @@ def _render_congestion_tab(fecha_ref):
                 pd.to_datetime(x["etb"]) - pd.to_datetime(x["eta"])
             ).dt.days,
             destino=lambda x: x["dest_orig"].fillna("s/d").str.strip().str.upper(),
+            producto=lambda x: x["cargo"].map(PRODUCTO_DISPLAY).fillna(x["cargo"]),
         )[
-            ["zona", "port", "vessel", "cargo", "quantity", "shipper_canon",
+            ["zona", "port", "berth", "vessel", "producto", "quantity", "shipper_canon",
              "destino", "eta", "etb", "ets", "dias_en_puerto", "demora_eta", "remarks"]
         ].rename(columns={
-            "zona": "Zona", "port": "Puerto", "vessel": "Buque",
-            "cargo": "Producto", "quantity": "Tons",
-            "shipper_canon": "Shipper", "destino": "Destino",
-            "eta": "ETA orig", "etb": "ETB", "ets": "ETS",
-            "dias_en_puerto": "Dias en puerto",
+            "zona": "Zona", "port": "Puerto", "berth": "Muelle", "vessel": "Buque",
+            "producto": "Producto", "quantity": "Toneladas",
+            "shipper_canon": "Comprador", "destino": "Destino",
+            "eta": "ETA", "etb": "ETB", "ets": "ETS",
+            "dias_en_puerto": "Días en puerto",
             "demora_eta": "Demora ETA (d)",
             "remarks": "Estado",
         })
         df_det = df_det.sort_values(["Zona", "Puerto"])
 
-        # Filtros: Producto, Shipper, Zona, Destino en una fila.
+        # Filtros: Producto, Comprador, Zona, Destino en una fila.
         fc1, fc2, fc3, fc4 = st.columns(4)
         f_prod  = fc1.multiselect(
-            "Producto", sorted(df_det["Producto"].dropna().unique()), key="cng_prod")
+            "Producto",  sorted(df_det["Producto"].dropna().unique()),  key="cng_prod")
         f_ship  = fc2.multiselect(
-            "Shipper",  sorted(df_det["Shipper"].dropna().unique()),  key="cng_ship")
+            "Comprador", sorted(df_det["Comprador"].dropna().unique()), key="cng_ship")
         f_zona  = fc3.multiselect(
-            "Zona",     sorted(df_det["Zona"].dropna().unique()),     key="cng_zona")
+            "Zona",      sorted(df_det["Zona"].dropna().unique()),      key="cng_zona")
         f_dest  = fc4.multiselect(
-            "Destino",  sorted(df_det["Destino"].dropna().unique()),  key="cng_dest")
+            "Destino",   sorted(df_det["Destino"].dropna().unique()),   key="cng_dest")
 
         mask = pd.Series(True, index=df_det.index)
         if f_prod:  mask &= df_det["Producto"].isin(f_prod)
-        if f_ship:  mask &= df_det["Shipper"].isin(f_ship)
+        if f_ship:  mask &= df_det["Comprador"].isin(f_ship)
         if f_zona:  mask &= df_det["Zona"].isin(f_zona)
         if f_dest:  mask &= df_det["Destino"].isin(f_dest)
 
@@ -3381,7 +3414,7 @@ def _render_congestion_tab(fecha_ref):
                     )
 
 
-if _tab_sel == "⚓ CONGESTION":
+if _tab_sel == "⚓ CONGESTIÓN":
     _render_congestion_tab(fecha_ref)
 
 

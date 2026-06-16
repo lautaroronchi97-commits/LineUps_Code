@@ -74,12 +74,12 @@ CANONICAL_MAP: list[tuple[str, list[str]]] = [
         r"ASOC\s+COOP\s+ARG",
     ]),
     ("MOLINOS", [
-        r"\bMOLINOS\b",  # cubre "MOLINOS AGRO" y "MOLINOS RIO DE LA PLATA"
+        r"\bMOLINOS\s+AGRO\b",       # exportador de granos (NO los molinos harineros)
+        r"MOLINOS\s+RIO\s+DE\s+LA\s+PLATA",
     ]),
     ("QUILMES", [
         r"\bQUILMES\b",
         r"MALTERIA\s+QUILMES",
-        r"\bMALTERIA\b",  # en contexto agro = Quilmes casi siempre
     ]),
     # Players agro-industriales de segunda linea pero relevantes
     ("GLENCORE", [
@@ -90,6 +90,30 @@ CANONICAL_MAP: list[tuple[str, list[str]]] = [
     ]),
     ("PROMASA", [
         r"\bPROMASA\b",
+    ]),
+    # ----- Exportadores/originadores de granos agregados (pedido del usuario) -----
+    # Se diferencian en el ranking en vez de caer en "OTROS".
+    ("AMAGGI", [
+        r"\bAMAGGI\b",
+    ]),
+    ("CHS", [
+        r"\bCHS\b",  # CHS de Argentina / CHS UY -> mismo canonico (flag PY/UY aparte)
+    ]),
+    ("U.A. AVELLANEDA", [
+        r"UNION\s+AGRICOLA\s+(DE\s+)?AVELLANEDA",
+        r"UNI[OÓ]N\s+AGR[IÍ]COLA\s+(DE\s+)?AVELLANEDA",
+    ]),
+    ("GEAR", [
+        r"\bGEAR\b",
+    ]),
+    ("ALEA", [
+        r"\bALEA\b",
+    ]),
+    ("CURCIJA", [
+        r"\bCURCIJA\b",
+    ]),
+    ("BOORTMALT", [
+        r"\bBOORTMALT\b",
     ]),
 ]
 
@@ -105,6 +129,14 @@ SHIPPERS_TOP = [
     "MOLINOS",
     "QUILMES",
     "GLENCORE",
+    "OLAM",
+    "AMAGGI",
+    "CHS",
+    "U.A. AVELLANEDA",
+    "GEAR",
+    "ALEA",
+    "CURCIJA",
+    "BOORTMALT",
 ]
 
 # Patron para detectar filiales regionales (Paraguay/Uruguay).

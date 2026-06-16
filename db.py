@@ -355,19 +355,24 @@ def query_exports_prioritarios(
 
     Es la base para Panorama, Shippers y Productos.
     """
-    from config import CODIGOS_PRIORITARIOS
+    from config import CODIGOS_PRIORITARIOS, COLAPSO_PRODUCTO, colapsar_producto
     from shipper_norm import aplicar_a_dataframe
 
+    # Traemos tambien los codigos que se colapsan a un producto prioritario
+    # (ej SHULLS -> SBM, "Sub prod soja"), si no quedarian afuera del fetch.
+    cargos_fetch = list(CODIGOS_PRIORITARIOS | set(COLAPSO_PRODUCTO.keys()))
+
     # Traemos solo las columnas que el dashboard y los modulos consumen, en vez
-    # de "select *". Excluimos id, berth, area, created_at (verificado: no se
-    # usan como columnas de DataFrame en dashboard.py ni en los modulos). Esto
-    # baja el peso de la query y el uso de RAM del master cache.
+    # de "select *". Excluimos id, area, created_at (no se usan). Incluimos
+    # `berth` porque la zonificacion Up River Norte/Sur se hace a nivel de muelle
+    # (el campo `port` agrupa mal: "ROSARIO"/"SAN LORENZO" son paraguas que
+    # mezclan terminales de zonas distintas).
     df = query_lineup(
         fecha_desde=fecha_desde,
         fecha_hasta=fecha_hasta,
-        cargos=list(CODIGOS_PRIORITARIOS),
+        cargos=cargos_fetch,
         columns=(
-            "fecha_consulta, port, vessel, ops, cat, cargo, quantity, "
+            "fecha_consulta, port, berth, vessel, ops, cat, cargo, quantity, "
             "dest_orig, shipper, eta, etb, ets, remarks, es_agro"
         ),
     )
@@ -377,6 +382,9 @@ def query_exports_prioritarios(
     # Solo exportaciones (LOAD). El usuario no quiere imports en el dashboard.
     df = df[df["ops"] == "LOAD"].copy()
 
+    # Colapsar codigos derivados a su producto padre (SHULLS -> SBM).
+    df["cargo"] = df["cargo"].map(colapsar_producto)
+
     # Normalizar shippers (agrega shipper_canon y origen_alt).
     df = aplicar_a_dataframe(df)
 
@@ -384,7 +392,7 @@ def query_exports_prioritarios(
     # filas). category para texto de baja cardinalidad, float32 para tonelaje.
     # No cambia los numeros mostrados (float32 tiene precision de sobra para
     # toneladas, que se redondean a enteros al mostrarse).
-    for col in ("cargo", "port", "shipper_canon", "ops", "origen_alt"):
+    for col in ("cargo", "port", "berth", "shipper_canon", "ops", "origen_alt"):
         if col in df.columns:
             df[col] = df[col].astype("category")
     if "quantity" in df.columns:

@@ -87,22 +87,37 @@ PRODUCTOS_AGRO_TODOS = (
 # La familia se usa para agrupar en el tab Panorama.
 
 PRODUCTOS_PRIORITARIOS = [
-    # (codigo, display, familia)
-    ("SBS",     "Soja",          "Soja"),
-    ("SBM",     "Harina soja",   "Soja"),
-    ("SBO",     "Aceite soja",   "Soja"),
-    ("MAIZE",   "Maiz",          "Maiz"),
-    ("WHEAT",   "Trigo",         "Trigo"),
-    ("BARLEY",  "Cebada",        "Cebada"),
-    ("SORGHUM", "Sorgo",         "Sorgo"),
-    ("SFSEED",  "Girasol",       "Girasol"),
+    # (codigo, display, familia) — solo los 7 que le interesan al usuario, en espanol.
+    ("SBS",     "Soja",           "Soja"),
+    ("SBO",     "Aceite de soja", "Soja"),
+    ("SBM",     "Sub prod soja",  "Soja"),   # incluye harina, pellets y cascara (SHULLS)
+    ("MAIZE",   "Maíz",           "Maíz"),
+    ("WHEAT",   "Trigo",          "Trigo"),
+    ("BARLEY",  "Cebada",         "Cebada"),  # solo forrajera (MALT/cervecera se excluye)
+    ("SORGHUM", "Sorgo",          "Sorgo"),
 ]
 
 # Set de codigos para filtros rapidos.
 CODIGOS_PRIORITARIOS = {codigo for codigo, _, _ in PRODUCTOS_PRIORITARIOS}
 
-# Display label por codigo (ej "SBM" -> "Harina soja").
+# Display label por codigo (ej "SBM" -> "Sub prod soja").
 PRODUCTO_DISPLAY = {codigo: display for codigo, display, _ in PRODUCTOS_PRIORITARIOS}
+
+
+# Colapso de codigos crudos a su producto "padre" para agregaciones/display.
+# La cascara de soja (SHULLS) se suma a "Sub prod soja" (SBM) por pedido del
+# usuario. El resto de los codigos se dejan como vienen (y luego se filtran si
+# no estan en CODIGOS_PRIORITARIOS).
+COLAPSO_PRODUCTO: dict[str, str] = {
+    "SHULLS": "SBM",
+}
+
+
+def colapsar_producto(codigo: str | None) -> str | None:
+    """Devuelve el codigo 'padre' de un producto (ej SHULLS -> SBM)."""
+    if codigo is None:
+        return None
+    return COLAPSO_PRODUCTO.get(codigo, codigo)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +139,13 @@ SHIPPER_COLORS: dict[str, str] = {
     "QUILMES":       "#FF6600",  # naranja (cerveza)
     "GLENCORE":      "#9999FF",  # celeste
     "OLAM":          "#FFCC33",  # mostaza
+    "AMAGGI":        "#00B894",  # verde agua
+    "CHS":           "#E17055",  # terracota
+    "U.A. AVELLANEDA": "#74B9FF",  # celeste claro (cooperativa)
+    "GEAR":          "#A29BFE",  # lavanda
+    "ALEA":          "#FAB1A0",  # salmon
+    "CURCIJA":       "#FFEAA7",  # amarillo palido
+    "BOORTMALT":     "#55EFC4",  # menta (malteria)
     "OTROS":         "#808080",  # gris neutro
 }
 
@@ -322,6 +344,92 @@ def zona_de_puerto(port: str | None) -> str:
         return "Alto Parana"
     if "LA PLATA" in p or "DOCK SUD" in p or "BUENOS AIRES" in p:
         return "Buenos Aires/La Plata"
+    return "Otros"
+
+
+# ---------------------------------------------------------------------------
+# Zonificacion Up River por BERTH (muelle) — Norte / Sur
+# ---------------------------------------------------------------------------
+# El campo `port` agrupa mal: "ROSARIO" y "SAN LORENZO" son etiquetas paraguas
+# que mezclan terminales de zonas distintas (ej. bajo "ROSARIO" caen muelles
+# fisicamente en Gral. Lagos, Punta Alvear y Arroyo Seco, que son zona SUR).
+# La ubicacion real esta en `berth`. Estas reglas se derivaron de los datos
+# reales + el conocimiento de negocio del usuario (que comprador opera cada
+# muelle). Se evaluan por substring/regex sobre el berth en MAYUSCULAS.
+#
+# Convencion de zonas devueltas:
+#   "Up River Norte"  : San Lorenzo, Puerto Gral. San Martin, Timbues, Ricardone
+#   "Up River Sur"    : Rosario (ciudad), Gral. Lagos, Punta Alvear, Arroyo Seco,
+#                       Villa Gob. Galvez (VGG), Ramallo
+#   "Bahia Blanca", "Necochea/Quequen", "Otros"
+
+import re as _re
+
+# Patrones SUR (excepciones que muchas veces vienen bajo port="SAN LORENZO" o
+# "ROSARIO"). Se chequean PRIMERO. Usan \b para evitar falsos positivos.
+_BERTH_SUR = [_re.compile(p) for p in (
+    r"GRAL\.?\s+LAGOS", r"GENERAL\s+LAGOS",
+    r"PUNTA\s+ALVEAR", r"\bALVEAR\b",
+    r"\(AS\)", r"ARROYO\s+SECO",
+    r"\bVGG\b", r"GOB.*GALVEZ",
+    r"UNIDAD\s+6", r"UNIDAD\s+7",
+    r"NUEVO\s+SUR", r"NUEVO\s+NORTE",   # terminales del puerto de Rosario ciudad
+    r"MUELLE\s+J\b", r"MUELLE\s+HI\b",
+    r"\bGUIDE\b",
+    r"RAMALLO",
+)]
+
+# Patrones NORTE (San Lorenzo / San Martin / Timbues / Ricardone).
+_BERTH_NORTE = [_re.compile(p) for p in (
+    r"RENOVA",
+    r"SAN\s+BENITO",
+    r"TERMINAL\s+6",
+    r"QUEBRACHO",
+    r"VICENTIN",
+    r"TIMBUES",           # DREYFUS/COFCO/AGD/ACA TIMBUES
+    r"\bPGSM\b",          # Puerto Gral. San Martin
+    r"\bPAMPA\b", r"\bDEMPA\b",   # Bunge (San Martin)
+    r"\(SL\)",            # ADM AGRO (SL)
+    r"\bACA\b",           # ACA / ACA SAN LORENZO (evita match con CHACABUCO)
+)]
+
+# Puertos de carga fuera del Gran Rosario (fallback por `port`).
+_PORT_BAHIA = ("BAHIA", "GALVAN", "WHITE")
+_PORT_QUEQUEN = ("QUEQUEN", "NECOCHEA")
+_PORT_SAN_LORENZO = ("SAN LORENZO",)
+_PORT_ROSARIO = ("ROSARIO",)
+_PORT_RAMALLO = ("RAMALLO",)
+
+
+def zona_carga(port: str | None, berth: str | None) -> str:
+    """
+    Clasifica una operacion de carga en su zona, usando el berth (muelle) para
+    el Gran Rosario (Up River Norte/Sur) y el port como fallback.
+
+    Returns:
+        "Up River Norte", "Up River Sur", "Bahia Blanca", "Necochea/Quequen"
+        o "Otros".
+    """
+    b = (berth or "").upper().strip()
+    if b:
+        for pat in _BERTH_SUR:
+            if pat.search(b):
+                return "Up River Sur"
+        for pat in _BERTH_NORTE:
+            if pat.search(b):
+                return "Up River Norte"
+
+    p = (port or "").upper().strip()
+    if any(k in p for k in _PORT_BAHIA):
+        return "Bahia Blanca"
+    if any(k in p for k in _PORT_QUEQUEN):
+        return "Necochea/Quequen"
+    if any(k in p for k in _PORT_SAN_LORENZO):
+        return "Up River Norte"   # default del nodo norte
+    if any(k in p for k in _PORT_ROSARIO):
+        return "Up River Sur"     # Rosario ciudad = Sur
+    if any(k in p for k in _PORT_RAMALLO):
+        return "Up River Sur"
     return "Otros"
 
 

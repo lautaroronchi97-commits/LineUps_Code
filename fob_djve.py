@@ -292,16 +292,29 @@ def djve_por_producto_recientes(
         .reset_index()
     )
 
-    # Top exportador por producto.
+    # Top exportador por producto. Unificamos la razon_social con la misma
+    # normalizacion de shippers del line-up (BUNGE/VITERRA/etc se fusionan) para
+    # que el "top exportador" sea el comprador canonico y no una razon social
+    # cruda. Los exportadores no reconocidos quedan en "OTROS" y se excluyen del
+    # ranking del top (salvo que no haya ningun canonico, ahi cae a OTROS).
+    from shipper_norm import canonicalizar_shipper
+
+    sub = sub.copy()
+    sub["comprador"] = sub["razon_social"].map(
+        lambda r: canonicalizar_shipper(r)[0]
+    )
+    sub_top = sub[sub["comprador"] != "OTROS"]
+    if sub_top.empty:
+        sub_top = sub  # fallback: si todo es OTROS, no perdemos el dato
+
     top_exportador = (
-        sub.groupby(["codigo_interno", "razon_social"])["toneladas"].sum()
+        sub_top.groupby(["codigo_interno", "comprador"])["toneladas"].sum()
         .reset_index()
         .sort_values(["codigo_interno", "toneladas"], ascending=[True, False])
         .groupby("codigo_interno")
         .first()
         .reset_index()
-        .rename(columns={"razon_social": "razon_social_top",
-                         "toneladas": "toneladas_top"})[
+        .rename(columns={"comprador": "razon_social_top"})[
             ["codigo_interno", "razon_social_top"]
         ]
     )
