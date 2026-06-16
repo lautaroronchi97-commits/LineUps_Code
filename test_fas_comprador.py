@@ -162,10 +162,10 @@ class TestUrgenciaPorShipper(unittest.TestCase):
         self.assertFalse(r_adm.empty)
         self.assertGreater(r_cargill.values[0], r_adm.values[0])
 
-    # --- Producto fuera de PRODUCTOS_FAS no aparece ---
+    # --- Producto fuera de PRODUCTOS_FAS no aparece (girasol está excluido) ---
     def test_producto_fuera_fas_no_aparece(self):
-        djve = pd.DataFrame([_djve("TRADIG", "BARLEY", 100_000, 0, 30)])
-        lineup = pd.DataFrame([_vessel("TRADIG", "BARLEY", 30_000, 5)])
+        djve = pd.DataFrame([_djve("TRADIG", "SFSEED", 100_000, 0, 30)])
+        lineup = pd.DataFrame([_vessel("TRADIG", "SFSEED", 30_000, 5)])
         res = urgencia_por_shipper(djve, lineup, REF, horizontes=[15])
         df = res[15]
         self.assertTrue(df.empty)

@@ -39,8 +39,9 @@ logger = logging.getLogger(__name__)
 # Un Panamax típico carga ~65.000 tn. Es la unidad de calibración del score.
 PANAMAX_TN = 65_000.0
 
-# Productos relevantes para un trader FAS de soja/maíz/trigo.
-PRODUCTOS_FAS = {"SBS", "SBM", "SBO", "MAIZE", "WHEAT"}
+# Productos relevantes para el trader FAS (los 7 prioritarios del dashboard:
+# soja y derivados, maíz, trigo, cebada y sorgo).
+PRODUCTOS_FAS = {"SBS", "SBM", "SBO", "MAIZE", "WHEAT", "BARLEY", "SORGHUM"}
 
 HORIZONTES_DEFAULT = [7, 15, 30]
 

@@ -3434,6 +3434,8 @@ _GRUPO_PRODUCTOS = {
     "Soja": {"SBS", "SBM", "SBO"},
     "Maíz": {"MAIZE"},
     "Trigo": {"WHEAT"},
+    "Cebada": {"BARLEY"},
+    "Sorgo": {"SORGHUM"},
 }
 
 
