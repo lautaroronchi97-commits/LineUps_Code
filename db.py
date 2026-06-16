@@ -95,6 +95,41 @@ def get_client() -> Client:
 # Upsert
 # ---------------------------------------------------------------------------
 
+def _dedupe_por_conflicto(
+    filas: list[dict[str, Any]], conflict_cols: str
+) -> list[dict[str, Any]]:
+    """
+    Colapsa filas con la misma clave de conflicto antes de mandarlas a Supabase.
+
+    Postgres rechaza un `INSERT ... ON CONFLICT DO UPDATE` si DOS filas del
+    mismo comando proponen la misma clave ("ON CONFLICT DO UPDATE command
+    cannot affect row a second time"). Esto pasa tipicamente con archivos
+    "acumulados" subidos a mano que traen la misma fila repetida (revisiones,
+    desagregados que colapsan a la misma clave, etc). Nos quedamos con la
+    ULTIMA fila de cada grupo, asumiendo que el archivo viene ordenado de mas
+    vieja a mas nueva.
+
+    Args:
+        filas: lista de dicts a upsertear.
+        conflict_cols: string "col1,col2,..." (mismo formato que `on_conflict`).
+
+    Returns:
+        Lista sin duplicados de clave. Mismo orden relativo de aparicion.
+    """
+    cols = conflict_cols.split(",")
+    por_clave: dict[tuple, dict[str, Any]] = {}
+    for fila in filas:
+        clave = tuple(fila.get(c) for c in cols)
+        por_clave[clave] = fila
+    if len(por_clave) != len(filas):
+        logger.warning(
+            "Se descartaron %d filas con clave de conflicto (%s) duplicada "
+            "dentro del mismo lote; se conserva la ultima de cada grupo.",
+            len(filas) - len(por_clave), conflict_cols,
+        )
+    return list(por_clave.values())
+
+
 def upsert_lineup(filas: list[dict[str, Any]], batch_size: int = UPSERT_BATCH_SIZE) -> int:
     """
     Inserta (o actualiza si ya existen) filas en la tabla `lineup`.
@@ -109,6 +144,7 @@ def upsert_lineup(filas: list[dict[str, Any]], batch_size: int = UPSERT_BATCH_SI
     if not filas:
         return 0
 
+    filas = _dedupe_por_conflicto(filas, UPSERT_CONFLICT_COLUMNS)
     client = get_client()
     total = 0
 
@@ -485,6 +521,7 @@ def upsert_djve(filas: list[dict[str, Any]],
     if not filas:
         return 0
 
+    filas = _dedupe_por_conflicto(filas, UPSERT_CONFLICT_DJVE)
     client = get_client()
     total = 0
 
@@ -573,6 +610,7 @@ def upsert_compras(filas: list[dict[str, Any]],
     if not filas:
         return 0
 
+    filas = _dedupe_por_conflicto(filas, UPSERT_CONFLICT_COMPRAS)
     client = get_client()
     total = 0
     for inicio in range(0, len(filas), batch_size):
