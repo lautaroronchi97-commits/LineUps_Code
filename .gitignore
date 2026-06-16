@@ -27,5 +27,8 @@ logs/
 *.tmp
 *.bak
 
+# Entregables generados (reportes/inventarios para revision, no son codigo)
+*.docx
+
 # Claude Code (asistente local, no va al repo)
 .claude/
