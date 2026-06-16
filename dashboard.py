@@ -39,7 +39,8 @@ import streamlit as st
 # Solo cargamos URL y ANON_KEY desde st.secrets.
 # La SERVICE_ROLE_KEY NO debe estar en secrets del dashboard (usa solo anon_key).
 # Si alguien la agrego por error, fallamos rapido con un mensaje claro.
-for _nombre_secret in ("SUPABASE_URL", "SUPABASE_ANON_KEY"):
+# CARGA_PASSWORD (opcional): si esta definida, protege la pestana CARGA con clave.
+for _nombre_secret in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "CARGA_PASSWORD"):
     try:
         _valor = st.secrets[_nombre_secret]
         if isinstance(_valor, str):
@@ -91,7 +92,9 @@ from db import (
     query_lineup,
     ultima_actualizacion_lineup,
     ultima_fecha_cargada,
+    upsert_compras,
 )
+import cargar_compras as _cargar_compras_mod
 from shipper_norm import SHIPPERS_TOP, aplicar_a_dataframe
 import fas_comprador
 
@@ -1324,13 +1327,14 @@ _render_senales_hoy()
 # Pestanas
 # ===========================================================================
 
-tab_mesa, tab_pan, tab_shp, tab_prd, tab_cng, tab_fas = st.tabs([
+tab_mesa, tab_pan, tab_shp, tab_prd, tab_cng, tab_fas, tab_carga = st.tabs([
     "🔥 MESA",
     "📊 PANORAMA",
     "🏢 SHIPPERS",
     "🌾 PRODUCTOS",
     "⚓ CONGESTION",
     "🎯 COMPRADORES FAS",
+    "📤 CARGA",
 ])
 
 
@@ -3498,6 +3502,139 @@ def _render_fas_comprador_tab(fecha_ref: date) -> None:
 
 with tab_fas:
     _render_fas_comprador_tab(fecha_ref)
+
+
+# ===========================================================================
+# Pestaña CARGA: carga manual de compras MAGyP
+# ===========================================================================
+
+def _carga_autorizada() -> bool:
+    """
+    Controla el acceso a la pestaña CARGA con una contraseña opcional.
+
+    - Si CARGA_PASSWORD NO está configurada → acceso abierto (devuelve True),
+      con un aviso de que conviene protegerla.
+    - Si está configurada → pide la clave y la recuerda en la sesión.
+
+    Devuelve True si el usuario puede operar el panel de carga.
+    """
+    password_real = os.getenv("CARGA_PASSWORD", "").strip()
+
+    if not password_real:
+        st.info(
+            "🔓 Carga **sin contraseña**: cualquiera con el link puede subir datos. "
+            "Para protegerla, definí `CARGA_PASSWORD` en los secrets de Streamlit "
+            "(o en `.env` local)."
+        )
+        return True
+
+    if st.session_state.get("carga_autenticado"):
+        return True
+
+    st.markdown("🔒 **Panel protegido.** Ingresá la contraseña para cargar datos.")
+    intento = st.text_input(
+        "Contraseña", type="password", key="carga_password_input",
+    )
+    if not intento:
+        return False
+
+    # compare_digest evita filtrar la longitud/contenido por timing.
+    import hmac
+    if hmac.compare_digest(intento, password_real):
+        st.session_state["carga_autenticado"] = True
+        st.rerun()
+    else:
+        st.error("Contraseña incorrecta.")
+    return False
+
+
+def _render_carga_compras_tab() -> None:
+    st.subheader("📤 Carga de Comercialización MAGyP")
+    st.caption(
+        "Subí el archivo semanal de compras (SIO-Granos) para actualizar la base. "
+        "La carga escribe en la tabla `compras` vía RLS pública."
+    )
+
+    if not _carga_autorizada():
+        return
+
+    st.markdown(
+        "**Paso 1 —** Abrí el MAGyP y descargá el CSV o XLSX más reciente "
+        "de _Comercialización de Granos_ (desde tu navegador en Argentina):"
+    )
+    st.link_button(
+        "🔗 Abrir MAGyP — Comercialización de Granos",
+        "https://datos.magyp.gob.ar/dataset/compras-de-granos",
+        use_container_width=True,
+    )
+    st.markdown("**Paso 2 —** Subí acá el archivo descargado:")
+    st.divider()
+
+    uploaded = st.file_uploader(
+        "Subí la planilla del MAGyP",
+        type=["csv", "xlsx", "xls"],
+        help="CSV o XLSX de comercialización de granos (SIO-Granos MAGyP).",
+        key="carga_compras_uploader",
+    )
+
+    if uploaded is None:
+        st.info("Subí un archivo para continuar.")
+        return
+
+    # Parsear el archivo subido.
+    suffix = uploaded.name.rsplit(".", 1)[-1].lower()
+    try:
+        df_preview = _cargar_compras_mod._leer_bytes(uploaded.getvalue(), suffix)
+    except ValueError as exc:
+        st.error(f"No se pudo leer el archivo:\n\n{exc}")
+        return
+
+    filas_preview = _cargar_compras_mod._df_a_filas(df_preview)
+
+    # Preview: resumen por grano.
+    st.markdown(f"**Archivo:** `{uploaded.name}` · {len(df_preview):,} filas leídas")
+    resumen = _cargar_compras_mod.resumen_granos_df(df_preview)
+    st.dataframe(resumen, use_container_width=True, hide_index=True)
+
+    mapeadas = resumen["Estado"].str.startswith("✅").sum()
+    omitidas = len(resumen) - mapeadas
+    col_ok, col_warn = st.columns(2)
+    col_ok.metric("Granos mapeados", mapeadas)
+    if omitidas:
+        col_warn.metric("Sin mapeo (se omiten)", omitidas, delta_color="off")
+
+    if not filas_preview:
+        st.error(
+            "Ninguna fila tiene codigo_interno + sector + fecha válidos. "
+            "Verificá que sea la planilla correcta del MAGyP."
+        )
+        return
+
+    st.success(f"**{len(filas_preview):,} filas listas para subir a Supabase.**")
+
+    if st.button("⬆️ Confirmar y subir a Supabase", type="primary",
+                 key="btn_confirmar_carga"):
+        with st.spinner("Subiendo datos..."):
+            try:
+                upsert_compras(filas_preview)
+            except Exception as exc:
+                st.error(
+                    f"Error al subir datos: {exc}\n\n"
+                    "Si dice 'row-level security', falta correr las políticas de "
+                    "escritura de `compras.sql` en el SQL Editor de Supabase."
+                )
+                return
+
+        st.success(
+            f"✅ **{len(filas_preview):,} filas cargadas correctamente.** "
+            "El índice MESA y COMPRADORES FAS reflejarán los nuevos datos en el próximo refresco."
+        )
+        # Limpiar el cache de compras para que el dashboard tome los datos nuevos.
+        cached_compras_fas.clear()
+
+
+with tab_carga:
+    _render_carga_compras_tab()
 
 
 # ---------------------------------------------------------------------------

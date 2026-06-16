@@ -28,11 +28,33 @@ create table if not exists public.compras (
 create index if not exists compras_codigo_campana_idx
     on public.compras (codigo_interno, campana);
 
--- RLS: el dashboard usa la anon key (solo lectura). Habilitar lectura publica
--- y dejar la escritura solo para la service_role (que ignora RLS).
+-- RLS: lectura publica para el dashboard (anon key).
 alter table public.compras enable row level security;
 
 drop policy if exists "compras lectura publica" on public.compras;
 create policy "compras lectura publica"
     on public.compras for select
     using (true);
+
+-- ESCRITURA PUBLICA EN compras (panel de carga web sin contrasena).
+--
+-- ADVERTENCIA DE SEGURIDAD: estas dos politicas permiten que CUALQUIERA con la
+-- anon key (o sea, cualquiera que abra la web publica) inserte y actualice filas
+-- en `compras`. Es el costo de tener el boton de carga en la web sin login.
+-- El dano esta ACOTADO a esta tabla: las politicas NO tocan `lineup` ni `djve`,
+-- y la service_role sigue siendo la unica con poder total. Si en el futuro
+-- agregas login o volves a carga solo-local, borra estas dos politicas:
+--   drop policy "compras escritura publica insert" on public.compras;
+--   drop policy "compras escritura publica update" on public.compras;
+drop policy if exists "compras escritura publica insert" on public.compras;
+create policy "compras escritura publica insert"
+    on public.compras for insert
+    with check (true);
+
+-- UPDATE necesario para que el UPSERT (insert ... on conflict do update) pueda
+-- sobreescribir una observacion semanal ya cargada (idempotencia).
+drop policy if exists "compras escritura publica update" on public.compras;
+create policy "compras escritura publica update"
+    on public.compras for update
+    using (true)
+    with check (true);
