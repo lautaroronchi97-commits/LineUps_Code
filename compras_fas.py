@@ -409,9 +409,8 @@ def posicion_exportadora(
     )
 
     # --- Enriquecer con display y campaña ---
-    df["producto_display"] = (
-        df["codigo_interno"].map(config.PRODUCTO_DISPLAY).fillna(df["codigo_interno"])
-    )
+    _ci = df["codigo_interno"].astype(str)
+    df["producto_display"] = _ci.map(config.PRODUCTO_DISPLAY).fillna(_ci)
     df["campana_actual"] = df["codigo_interno"].apply(
         lambda c: campanas.campana_de(c, fecha_ref)
     )
