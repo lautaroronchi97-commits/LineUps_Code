@@ -88,7 +88,14 @@ def canonicalizar_djve(df_djve: pd.DataFrame) -> pd.DataFrame:
         df["origen_alt"] = None
         return df
 
-    pares = df["razon_social"].map(canonicalizar_shipper)
+    # Optimizacion: canonicalizamos solo los valores unicos de razon_social y
+    # mapeamos de vuelta (la regex es cara y hay muchas filas con la misma
+    # razon social). Salida identica al .map() por fila.
+    serie = df["razon_social"]
+    uniques = serie.dropna().unique()
+    lut = {u: canonicalizar_shipper(u) for u in uniques}
+    fallback = ("OTROS", None)
+    pares = [lut.get(v, fallback) for v in serie]
     df["shipper_canon"] = [p[0] for p in pares]
     df["origen_alt"] = [p[1] for p in pares]
     return df
@@ -165,6 +172,30 @@ def _ratio(originado: float, declarado: float) -> float:
         # extremo (inf); si no hay nada, ratio neutro (NaN se trata aparte).
         return float("inf") if originado > 0 else float("nan")
     return originado / declarado
+
+
+def _ratio_vec(originado: pd.Series, declarado: pd.Series) -> pd.Series:
+    """
+    Version vectorizada de `_ratio` para aplicar sobre columnas enteras.
+
+    Reproduce exactamente la semantica escalar:
+      - declarado <= 0 y originado  > 0 -> inf (sobre-originado extremo)
+      - declarado <= 0 y originado <= 0 -> NaN (ni declarado ni originado)
+      - declarado  > 0                  -> originado / declarado
+    """
+    import numpy as np
+
+    orig = pd.to_numeric(originado, errors="coerce")
+    decl = pd.to_numeric(declarado, errors="coerce")
+    # Division segura (evita warnings de /0); luego sobreescribimos los bordes.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = orig / decl
+    sin_declarado = decl <= 0
+    ratio = ratio.where(
+        ~sin_declarado,
+        other=np.where(orig > 0, float("inf"), float("nan")),
+    )
+    return ratio
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +278,7 @@ def balance_por_producto(
         df[col] = df[col].fillna(0)
 
     df["falta_cubrir_tn"] = df["declarado_tn"] - df["originado_tn"]
-    df["ratio_cobertura"] = df.apply(
-        lambda r: _ratio(r["originado_tn"], r["declarado_tn"]), axis=1
-    )
+    df["ratio_cobertura"] = _ratio_vec(df["originado_tn"], df["declarado_tn"])
     df["producto_display"] = df["codigo_interno"].map(
         config.PRODUCTO_DISPLAY
     ).fillna(df["codigo_interno"])
@@ -332,9 +361,7 @@ def balance_por_shipper(
         df[col] = df[col].fillna(0)
 
     df["falta_cubrir_tn"] = df["declarado_tn"] - df["originado_tn"]
-    df["ratio_cobertura"] = df.apply(
-        lambda r: _ratio(r["originado_tn"], r["declarado_tn"]), axis=1
-    )
+    df["ratio_cobertura"] = _ratio_vec(df["originado_tn"], df["declarado_tn"])
     df["producto_display"] = df["codigo_interno"].map(
         config.PRODUCTO_DISPLAY
     ).fillna(df["codigo_interno"])

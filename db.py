@@ -278,7 +278,10 @@ def ping() -> dict[str, Any]:
     """
     try:
         client = get_client()
-        resp = client.table(TABLA_LINEUP).select("id", count="exact").limit(1).execute()
+        # count="planned" usa la estimacion del planner de Postgres en vez de
+        # un COUNT(*) exacto (que escanea toda la tabla). Mucho mas barato y
+        # suficiente para un health-check del dashboard.
+        resp = client.table(TABLA_LINEUP).select("id", count="planned").limit(1).execute()
         return {"conectado": True, "cantidad_filas": resp.count or 0, "error": None}
     except Exception as exc:  # noqa: BLE001 - queremos capturar cualquier cosa
         return {"conectado": False, "cantidad_filas": 0, "error": str(exc)}
@@ -306,10 +309,18 @@ def query_exports_prioritarios(
     from config import CODIGOS_PRIORITARIOS
     from shipper_norm import aplicar_a_dataframe
 
+    # Traemos solo las columnas que el dashboard y los modulos consumen, en vez
+    # de "select *". Excluimos id, berth, area, created_at (verificado: no se
+    # usan como columnas de DataFrame en dashboard.py ni en los modulos). Esto
+    # baja el peso de la query y el uso de RAM del master cache.
     df = query_lineup(
         fecha_desde=fecha_desde,
         fecha_hasta=fecha_hasta,
         cargos=list(CODIGOS_PRIORITARIOS),
+        columns=(
+            "fecha_consulta, port, vessel, ops, cat, cargo, quantity, "
+            "dest_orig, shipper, eta, etb, ets, remarks, es_agro"
+        ),
     )
     if df.empty:
         return df
@@ -319,6 +330,17 @@ def query_exports_prioritarios(
 
     # Normalizar shippers (agrega shipper_canon y origen_alt).
     df = aplicar_a_dataframe(df)
+
+    # Downcast de tipos para reducir RAM del master cache (cientos de miles de
+    # filas). category para texto de baja cardinalidad, float32 para tonelaje.
+    # No cambia los numeros mostrados (float32 tiene precision de sobra para
+    # toneladas, que se redondean a enteros al mostrarse).
+    for col in ("cargo", "port", "shipper_canon", "ops", "origen_alt"):
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+    if "quantity" in df.columns:
+        df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").astype("float32")
+
     return df
 
 
@@ -469,13 +491,19 @@ def upsert_djve(filas: list[dict[str, Any]],
     return total
 
 
-def query_djve(anio: int | None = None) -> pd.DataFrame:
+def query_djve(
+    anio: int | None = None,
+    anios: Iterable[int] | None = None,
+) -> pd.DataFrame:
     """
     Lee la tabla djve. Devuelve DataFrame con las mismas columnas que produce
     fob_djve.descargar_djve_acumuladas (sin `id`, sin `actualizado_en`).
 
     Args:
-        anio: si se pasa, filtra a ese ano. Si es None, trae todo.
+        anio: si se pasa, filtra a ese ano (igualdad).
+        anios: si se pasa, filtra a ese conjunto de anos (IN). Permite traer
+            varios anos en UNA sola query paginada en vez de N queries. Tiene
+            prioridad sobre `anio` si ambos se pasan.
 
     Returns:
         DataFrame vacio si no hay data.
@@ -486,7 +514,9 @@ def query_djve(anio: int | None = None) -> pd.DataFrame:
         "fecha_inicio_embarque, fecha_fin_embarque, opcion, razon_social, "
         "codigo_interno, anio"
     )
-    if anio is not None:
+    if anios is not None:
+        query = query.in_("anio", list(anios))
+    elif anio is not None:
         query = query.eq("anio", anio)
     query = query.order("fecha_registro", desc=False)
 

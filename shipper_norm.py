@@ -178,8 +178,18 @@ def aplicar_a_dataframe(
         df[col_origen] = None
         return df
 
-    # Una sola pasada + tuple unzip vectorizado.
-    pares = df[col_in].map(canonicalizar_shipper)
+    # Optimizacion: el line-up tiene ~200k filas pero solo ~282 valores unicos
+    # de shipper. Canonicalizamos SOLO los unicos y mapeamos de vuelta, en vez
+    # de correr la regex por fila. Salida identica al .map() por fila.
+    serie = df[col_in]
+    uniques = serie.dropna().unique()
+    lut: dict[Any, tuple[str, str | None]] = {
+        u: canonicalizar_shipper(u) for u in uniques
+    }
+    # NaN/None y valores no presentes en lut -> ("OTROS", None) (igual que
+    # canonicalizar_shipper sobre None).
+    fallback = ("OTROS", None)
+    pares = [lut.get(v, fallback) for v in serie]
     df[col_canon] = [p[0] for p in pares]
     df[col_origen] = [p[1] for p in pares]
     return df

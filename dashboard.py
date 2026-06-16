@@ -367,7 +367,7 @@ st.markdown(
 # Cached queries
 # ===========================================================================
 
-@st.cache_data(ttl=60, show_spinner="Consultando base...")
+@st.cache_data(ttl=900, show_spinner="Consultando base...")
 def cached_ping() -> dict:
     return ping()
 
@@ -592,18 +592,19 @@ def _anios_djve_historia(fecha_ref: date) -> tuple[int, ...]:
 
 @st.cache_data(ttl=3600)
 def cached_djve_multianio(anios: tuple[int, ...]) -> pd.DataFrame:
-    """DJVE de varios años concatenadas (para reconstrucción as-of histórica)."""
-    frames = []
-    for a in anios:
-        try:
-            df = cached_djve(a)
-        except Exception:
-            df = pd.DataFrame()
-        if not df.empty:
-            frames.append(df)
-    if not frames:
+    """
+    DJVE de varios años concatenadas (para reconstrucción as-of histórica).
+
+    Una SOLA query con filtro `anio IN (...)` (paginada una vez) en lugar de N
+    llamadas por año. `cached_djve` se mantiene para los call-sites por año.
+    """
+    if not anios:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    try:
+        df = query_djve(anios=anios)
+    except Exception:
+        df = pd.DataFrame()
+    return df if df is not None else pd.DataFrame()
 
 
 def _djve_asof(df_djve: pd.DataFrame, fecha: date) -> pd.DataFrame:
@@ -975,7 +976,6 @@ def _senal_zscore(z: float) -> str:
 
 @st.cache_data(ttl=900, show_spinner="Calculando z-scores...")
 def _calcular_zscores_shippers(
-    df_shp_all: pd.DataFrame,
     fecha_ref: date,
     ventana_dias: int,
 ) -> pd.DataFrame:
@@ -984,14 +984,18 @@ def _calcular_zscores_shippers(
     a lo largo de los ultimos 2 anos, y devuelve z-score actual vs su propia
     historia.
 
+    Deriva el slice de exports internamente (ultimos 2 anos hasta fecha_ref)
+    via `cached_exports_rango`, en vez de recibir el DataFrame como argumento
+    de cache. Asi la cache key es (fecha_ref, ventana_dias) escalares y no se
+    re-hashea/copia un DataFrame de cientos de miles de filas en cada render.
+
     Vectorizado: pivotea (fecha × buque) en una matriz binaria de presencia
     por shipper, hace un rolling-max sobre N dias (= "este buque aparecio
     al menos una vez en la ventana"), y suma columnas para obtener buques
     unicos en cada ventana. ~50× mas rapido que el loop original.
-
-    Cache 5 min: la entrada cambia con fecha_ref / ventana_dias / cantidad de
-    filas, asi que dentro de la misma sesion del usuario el cache pega.
     """
+    desde = fecha_ref - timedelta(days=730)
+    df_shp_all = cached_exports_rango(desde, fecha_ref)
     if df_shp_all.empty:
         return pd.DataFrame()
 
@@ -1220,10 +1224,16 @@ def pct_change(actual: float, prev: float) -> str:
 # Panel de alertas accionables: "Señales del día"
 # ===========================================================================
 
+@st.fragment
 def _render_senales_hoy():
     """
     Panel visible con alertas accionables basadas en datos ya cargados.
     No hace queries directas a la DB: usa las funciones cached_* existentes.
+
+    Envuelto en @st.fragment: el calculo de z-scores de shippers de 2 anos
+    se ejecuta en su propio ciclo de render, fuera del camino critico del
+    primer paint del dashboard (y no se re-ejecuta en cada rerun de otros
+    widgets de la pagina).
     """
     alertas_info    = []
     alertas_success = []
@@ -1277,25 +1287,21 @@ def _render_senales_hoy():
 
     # ---- Alerta: z-score de shippers (usando calc ya existente) ----
     if not _df_pan.empty:
-        _desde_shp_z = fecha_ref - timedelta(days=730)
-        _df_z_all = cached_exports_rango(_desde_shp_z, fecha_ref)
-        if not _df_z_all.empty:
-            _df_z_all["fecha_consulta"] = pd.to_datetime(_df_z_all["fecha_consulta"])
-            _df_zscores = _calcular_zscores_shippers(_df_z_all, fecha_ref, ventana_dias)
-            if not _df_zscores.empty:
-                for _, _zrow in _df_zscores.iterrows():
-                    _z = float(_zrow.get("Z-score", 0))
-                    _shp_n = _zrow["Shipper"]
-                    if _z >= 2:
-                        alertas_success.append(
-                            f"🔥 **Surge shipper** · {_shp_n} · "
-                            f"Z-score {_z:+.1f} (muy por encima de su media historica)"
-                        )
-                    elif _z <= -2:
-                        alertas_info.append(
-                            f"🔴 **Caida shipper** · {_shp_n} · "
-                            f"Z-score {_z:+.1f} (muy por debajo de su media historica)"
-                        )
+        _df_zscores = _calcular_zscores_shippers(fecha_ref, ventana_dias)
+        if not _df_zscores.empty:
+            for _, _zrow in _df_zscores.iterrows():
+                _z = float(_zrow.get("Z-score", 0))
+                _shp_n = _zrow["Shipper"]
+                if _z >= 2:
+                    alertas_success.append(
+                        f"🔥 **Surge shipper** · {_shp_n} · "
+                        f"Z-score {_z:+.1f} (muy por encima de su media historica)"
+                    )
+                elif _z <= -2:
+                    alertas_info.append(
+                        f"🔴 **Caida shipper** · {_shp_n} · "
+                        f"Z-score {_z:+.1f} (muy por debajo de su media historica)"
+                    )
 
     # ---- Renderizar ----
     total_alertas = len(alertas_warning) + len(alertas_success) + len(alertas_info)
@@ -2283,7 +2289,7 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     # set-unions Python puro -> 3-8s en cada render. La version vectorizada
     # construye una matriz pivot (fecha × buque) y hace un rolling-max sobre
     # el flag de presencia: 100% numpy/pandas.
-    df_senales = _calcular_zscores_shippers(df_shp_all, fecha_ref, ventana_dias)
+    df_senales = _calcular_zscores_shippers(fecha_ref, ventana_dias)
     df_senales = df_senales.merge(
         agg_vent[["Shipper", "tons"]], on="Shipper", how="left",
     )
