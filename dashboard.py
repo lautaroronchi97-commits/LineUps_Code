@@ -367,7 +367,20 @@ st.markdown(
 # Cached queries
 # ===========================================================================
 
-@st.cache_data(ttl=60, show_spinner="Consultando base...")
+# TODO (fase 3, perf server-side, NO aplicado): los 4 metadatos iniciales
+# (cached_ping, cached_ultima_fecha, cached_primera_fecha,
+# cached_ultima_actualizacion) hacen 4 round-trips separados a Supabase en el
+# cold start. Se podrian combinar en UNA sola RPC server-side, p.ej.:
+#   create function dashboard_meta() returns json language sql as $$
+#     select json_build_object(
+#       'cantidad', (select reltuples::bigint from pg_class where relname='lineup'),
+#       'ultima_fecha', (select max(fecha_consulta) from lineup),
+#       'primera_fecha', (select min(fecha_consulta) from lineup),
+#       'ultima_actualizacion', (select max(created_at) from lineup));
+#   $$;
+# y leerla con client.rpc("dashboard_meta"). No se implementa porque requiere
+# crear la function en Supabase (SQL server-side), imposible desde este entorno.
+@st.cache_data(ttl=900, show_spinner="Consultando base...")
 def cached_ping() -> dict:
     return ping()
 
@@ -424,6 +437,14 @@ def cached_serie_diaria_hist(desde: date, hasta: date) -> pd.DataFrame:
     """
     Serie diaria agregada (tons agro LOAD) entre [desde, hasta], derivada
     del master cache. No toca la DB.
+
+    TODO (fase 3, perf server-side, NO aplicado): para datasets muy grandes,
+    esta agregacion diaria seria mas barata como RPC/SQL en Supabase
+    (SELECT fecha_consulta::date, SUM(quantity) ... WHERE ops='LOAD' GROUP BY 1),
+    evitando traer todas las filas crudas al cliente. No se implementa porque
+    requiere crear/ejecutar SQL server-side en Supabase, que no es posible desde
+    este entorno (sin credenciales). En el cliente ya esta optimizado: deriva del
+    master cacheado (sin roundtrip por dia) y agrega con un unico groupby.
     """
     df = cached_master_exports(cached_ultima_fecha() or hasta)
     if df.empty:
@@ -540,9 +561,12 @@ def cached_fas_perfiles(fecha_ref: date) -> dict[tuple[str, str], dict]:
     # Extraer pares únicos del lineup de los últimos 90 días.
     from datetime import timedelta
     inicio_hist = fecha_ref - timedelta(days=90)
-    pares = set()
-    for _, row in df_lineup_hist[df_lineup_hist["cargo"].isin(fas_comprador.PRODUCTOS_FAS)].iterrows():
-        pares.add((row.get("shipper_canon", ""), row.get("cargo", "")))
+    pares = set(
+        df_lineup_hist[df_lineup_hist["cargo"].isin(fas_comprador.PRODUCTOS_FAS)]
+        [["shipper_canon", "cargo"]]
+        .drop_duplicates()
+        .itertuples(index=False, name=None)
+    )
     perfiles: dict[tuple[str, str], dict] = {}
     for shipper_canon, codigo_interno in pares:
         if not shipper_canon or not codigo_interno:
@@ -561,20 +585,52 @@ def cached_fas_perfiles(fecha_ref: date) -> dict[tuple[str, str], dict]:
 _MESA_PRODUCTOS = ["MAIZE", "WHEAT", "SOJA_CRUSH", "SBS"]
 
 
+# Indice {fecha_snap: sub_df} memoizado por identidad del master. El master
+# viene cacheado (mismo objeto durante el TTL), asi que indexamos una sola vez
+# y los cientos de _snapshot_lineup() posteriores son lookups O(1) en dict en
+# vez de un boolean-mask O(n) sobre todo el master cada vez.
+_SNAPSHOT_INDEX_CACHE: dict[int, dict[date, pd.DataFrame]] = {}
+
+
+def _indice_snapshots(master: pd.DataFrame) -> dict[date, pd.DataFrame]:
+    """Construye (o recupera memoizado) el dict {fecha_consulta: sub_df}."""
+    key = id(master)
+    cached = _SNAPSHOT_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    # Evitar fuga de memoria: el master rota cada dia, no acumulamos indices.
+    _SNAPSHOT_INDEX_CACHE.clear()
+    indice: dict[date, pd.DataFrame] = {}
+    if not master.empty:
+        if "fecha_day" in master.columns:
+            fechas = master["fecha_day"]
+        else:
+            fechas = pd.to_datetime(
+                master["fecha_consulta"], errors="coerce"
+            ).dt.date
+        for fecha, sub in master.groupby(fechas, observed=True):
+            if fecha is not None:
+                indice[fecha] = sub
+    _SNAPSHOT_INDEX_CACHE[key] = indice
+    return indice
+
+
 def _snapshot_lineup(master: pd.DataFrame, fecha_snap: date) -> pd.DataFrame:
     """Line-up tal como se vio en una fecha de consulta (snapshot exacto)."""
     if master.empty:
         return master
-    fechas = pd.to_datetime(master["fecha_consulta"], errors="coerce").dt.date
-    return master[fechas == fecha_snap].copy()
+    indice = _indice_snapshots(master)
+    sub = indice.get(fecha_snap)
+    if sub is None:
+        return master.iloc[0:0].copy()
+    return sub.copy()
 
 
 def _fechas_snapshot_disponibles(master: pd.DataFrame) -> list[date]:
     """Fechas de consulta únicas (snapshots) disponibles, ordenadas."""
     if master.empty:
         return []
-    fechas = pd.to_datetime(master["fecha_consulta"], errors="coerce").dt.date
-    return sorted({f for f in fechas if f is not None})
+    return sorted(_indice_snapshots(master).keys())
 
 
 def _anios_djve_historia(fecha_ref: date) -> tuple[int, ...]:
@@ -592,18 +648,19 @@ def _anios_djve_historia(fecha_ref: date) -> tuple[int, ...]:
 
 @st.cache_data(ttl=3600)
 def cached_djve_multianio(anios: tuple[int, ...]) -> pd.DataFrame:
-    """DJVE de varios años concatenadas (para reconstrucción as-of histórica)."""
-    frames = []
-    for a in anios:
-        try:
-            df = cached_djve(a)
-        except Exception:
-            df = pd.DataFrame()
-        if not df.empty:
-            frames.append(df)
-    if not frames:
+    """
+    DJVE de varios años concatenadas (para reconstrucción as-of histórica).
+
+    Una SOLA query con filtro `anio IN (...)` (paginada una vez) en lugar de N
+    llamadas por año. `cached_djve` se mantiene para los call-sites por año.
+    """
+    if not anios:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    try:
+        df = query_djve(anios=anios)
+    except Exception:
+        df = pd.DataFrame()
+    return df if df is not None else pd.DataFrame()
 
 
 def _djve_asof(df_djve: pd.DataFrame, fecha: date) -> pd.DataFrame:
@@ -975,7 +1032,6 @@ def _senal_zscore(z: float) -> str:
 
 @st.cache_data(ttl=900, show_spinner="Calculando z-scores...")
 def _calcular_zscores_shippers(
-    df_shp_all: pd.DataFrame,
     fecha_ref: date,
     ventana_dias: int,
 ) -> pd.DataFrame:
@@ -984,14 +1040,18 @@ def _calcular_zscores_shippers(
     a lo largo de los ultimos 2 anos, y devuelve z-score actual vs su propia
     historia.
 
+    Deriva el slice de exports internamente (ultimos 2 anos hasta fecha_ref)
+    via `cached_exports_rango`, en vez de recibir el DataFrame como argumento
+    de cache. Asi la cache key es (fecha_ref, ventana_dias) escalares y no se
+    re-hashea/copia un DataFrame de cientos de miles de filas en cada render.
+
     Vectorizado: pivotea (fecha × buque) en una matriz binaria de presencia
     por shipper, hace un rolling-max sobre N dias (= "este buque aparecio
     al menos una vez en la ventana"), y suma columnas para obtener buques
     unicos en cada ventana. ~50× mas rapido que el loop original.
-
-    Cache 5 min: la entrada cambia con fecha_ref / ventana_dias / cantidad de
-    filas, asi que dentro de la misma sesion del usuario el cache pega.
     """
+    desde = fecha_ref - timedelta(days=730)
+    df_shp_all = cached_exports_rango(desde, fecha_ref)
     if df_shp_all.empty:
         return pd.DataFrame()
 
@@ -1220,10 +1280,16 @@ def pct_change(actual: float, prev: float) -> str:
 # Panel de alertas accionables: "Señales del día"
 # ===========================================================================
 
+@st.fragment
 def _render_senales_hoy():
     """
     Panel visible con alertas accionables basadas en datos ya cargados.
     No hace queries directas a la DB: usa las funciones cached_* existentes.
+
+    Envuelto en @st.fragment: el calculo de z-scores de shippers de 2 anos
+    se ejecuta en su propio ciclo de render, fuera del camino critico del
+    primer paint del dashboard (y no se re-ejecuta en cada rerun de otros
+    widgets de la pagina).
     """
     alertas_info    = []
     alertas_success = []
@@ -1277,25 +1343,21 @@ def _render_senales_hoy():
 
     # ---- Alerta: z-score de shippers (usando calc ya existente) ----
     if not _df_pan.empty:
-        _desde_shp_z = fecha_ref - timedelta(days=730)
-        _df_z_all = cached_exports_rango(_desde_shp_z, fecha_ref)
-        if not _df_z_all.empty:
-            _df_z_all["fecha_consulta"] = pd.to_datetime(_df_z_all["fecha_consulta"])
-            _df_zscores = _calcular_zscores_shippers(_df_z_all, fecha_ref, ventana_dias)
-            if not _df_zscores.empty:
-                for _, _zrow in _df_zscores.iterrows():
-                    _z = float(_zrow.get("Z-score", 0))
-                    _shp_n = _zrow["Shipper"]
-                    if _z >= 2:
-                        alertas_success.append(
-                            f"🔥 **Surge shipper** · {_shp_n} · "
-                            f"Z-score {_z:+.1f} (muy por encima de su media historica)"
-                        )
-                    elif _z <= -2:
-                        alertas_info.append(
-                            f"🔴 **Caida shipper** · {_shp_n} · "
-                            f"Z-score {_z:+.1f} (muy por debajo de su media historica)"
-                        )
+        _df_zscores = _calcular_zscores_shippers(fecha_ref, ventana_dias)
+        if not _df_zscores.empty:
+            for _, _zrow in _df_zscores.iterrows():
+                _z = float(_zrow.get("Z-score", 0))
+                _shp_n = _zrow["Shipper"]
+                if _z >= 2:
+                    alertas_success.append(
+                        f"🔥 **Surge shipper** · {_shp_n} · "
+                        f"Z-score {_z:+.1f} (muy por encima de su media historica)"
+                    )
+                elif _z <= -2:
+                    alertas_info.append(
+                        f"🔴 **Caida shipper** · {_shp_n} · "
+                        f"Z-score {_z:+.1f} (muy por debajo de su media historica)"
+                    )
 
     # ---- Renderizar ----
     total_alertas = len(alertas_warning) + len(alertas_success) + len(alertas_info)
@@ -1327,7 +1389,12 @@ _render_senales_hoy()
 # Pestanas
 # ===========================================================================
 
-tab_mesa, tab_pan, tab_shp, tab_prd, tab_cng, tab_fas, tab_carga = st.tabs([
+# Selector de pestana persistido en session_state. A diferencia de st.tabs
+# (que renderiza el contenido de las 7 pestanas en cada rerun), aca renderizamos
+# SOLO la pestana seleccionada -> mucho menos trabajo por render. El estado de
+# los widgets internos de cada pestana sobrevive porque viven en session_state
+# por su `key`; solo se recalcula la pestana activa.
+_TABS = [
     "🔥 MESA",
     "📊 PANORAMA",
     "🏢 SHIPPERS",
@@ -1335,7 +1402,15 @@ tab_mesa, tab_pan, tab_shp, tab_prd, tab_cng, tab_fas, tab_carga = st.tabs([
     "⚓ CONGESTION",
     "🎯 COMPRADORES FAS",
     "📤 CARGA",
-])
+]
+_tab_sel = st.radio(
+    "Pestaña",
+    _TABS,
+    index=0,  # Default: MESA
+    horizontal=True,
+    label_visibility="collapsed",
+    key="tab_seleccionada",
+)
 
 
 # ==========================================================================
@@ -2283,7 +2358,7 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
     # set-unions Python puro -> 3-8s en cada render. La version vectorizada
     # construye una matriz pivot (fecha × buque) y hace un rolling-max sobre
     # el flag de presencia: 100% numpy/pandas.
-    df_senales = _calcular_zscores_shippers(df_shp_all, fecha_ref, ventana_dias)
+    df_senales = _calcular_zscores_shippers(fecha_ref, ventana_dias)
     df_senales = df_senales.merge(
         agg_vent[["Shipper", "tons"]], on="Shipper", how="left",
     )
@@ -2548,13 +2623,13 @@ def _render_shippers_tab(fecha_ref, ventana_dias):
 # archivo y la ejecucion de los tabs siga el orden visual del usuario.
 # ==========================================================================
 
-with tab_mesa:
+if _tab_sel == "🔥 MESA":
     _render_mesa_tab(fecha_ref)
 
-with tab_pan:
+if _tab_sel == "📊 PANORAMA":
     _render_panorama_tab(fecha_ref, ventana_dias)
 
-with tab_shp:
+if _tab_sel == "🏢 SHIPPERS":
     _render_shippers_tab(fecha_ref, ventana_dias)
 
 
@@ -3108,7 +3183,7 @@ def _render_productos_tab(fecha_ref):
                 )
 
 
-with tab_prd:
+if _tab_sel == "🌾 PRODUCTOS":
     _render_productos_tab(fecha_ref)
 
 
@@ -3306,7 +3381,7 @@ def _render_congestion_tab(fecha_ref):
                     )
 
 
-with tab_cng:
+if _tab_sel == "⚓ CONGESTION":
     _render_congestion_tab(fecha_ref)
 
 
@@ -3500,7 +3575,7 @@ def _render_fas_comprador_tab(fecha_ref: date) -> None:
 """)
 
 
-with tab_fas:
+if _tab_sel == "🎯 COMPRADORES FAS":
     _render_fas_comprador_tab(fecha_ref)
 
 
@@ -3633,7 +3708,7 @@ def _render_carga_compras_tab() -> None:
         cached_compras_fas.clear()
 
 
-with tab_carga:
+if _tab_sel == "📤 CARGA":
     _render_carga_compras_tab()
 
 

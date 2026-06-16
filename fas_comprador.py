@@ -261,6 +261,16 @@ def perfil_historico(
     if djve_sh.empty:
         return _sin_historia
 
+    # TODO (fase 3, perf, NO aplicado a proposito): este loop de ~12 semanas
+    # llama a cobertura.balance_por_shipper una vez por semana. Una version
+    # totalmente vectorizada (sin loop) seria mas rapida, pero cada semana usa
+    # una ventana de embarque de 7 dias SOLAPADA con la siguiente y la semantica
+    # exacta de solapamiento de intervalos DJVE/ETB de balance_por_shipper es
+    # dificil de replicar sin alterar los resultados. No se reescribe porque no
+    # se puede garantizar salida identica a los tests existentes. El costo
+    # dominante (re-canonicalizar la DJVE en cada llamada) YA se elimino via el
+    # memo de cobertura.canonicalizar_djve (fase 2), asi que cada balance opera
+    # sobre frames chicos ya canonicalizados.
     # Analizar semana a semana en los últimos ventana_dias días.
     semana_dias = 7
     n_semanas = ventana_dias // semana_dias
