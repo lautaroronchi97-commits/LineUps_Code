@@ -99,6 +99,7 @@ import cargar_compras as _cargar_compras_mod
 from shipper_norm import SHIPPERS_TOP, aplicar_a_dataframe
 import compras_fas
 import fas_comprador
+import puerto
 
 # ===========================================================================
 # Configuracion general de la pagina
@@ -539,6 +540,42 @@ def cached_serie_congestion(desde: date, hasta: date) -> pd.DataFrame:
         df_ep.groupby(["fecha", "zona"])["vessel"]
         .nunique().reset_index(name="buques")
     )
+
+
+@st.cache_data(ttl=900)
+def cached_congestion_estado(fecha_ref: date, ventana_dias: int = 90) -> pd.DataFrame:
+    """
+    Estado de congestión de cada zona hoy vs su historia (Q6).
+
+    Reutiliza la serie de buques simultáneos en puerto de los últimos
+    `ventana_dias` y calcula el percentil del día de referencia por zona.
+    """
+    desde = fecha_ref - timedelta(days=ventana_dias)
+    serie = cached_serie_congestion(desde, fecha_ref)
+    return puerto.congestion_por_zona(serie, fecha_ref, ventana_dias)
+
+
+@st.cache_data(ttl=900)
+def cached_sequia_buques(fecha_ref: date, horizonte_dias: int = 7) -> pd.DataFrame:
+    """
+    Buques que vienen a cargar por zona en los próximos `horizonte_dias` (Q5).
+
+    Usa el último snapshot del line-up (los buques con ETB futuro) ya
+    zonificado por muelle.
+    """
+    master = cached_master_exports(cached_ultima_fecha() or fecha_ref)
+    snapshots = _fechas_snapshot_disponibles(master)
+    snap_hoy = max((s for s in snapshots if s <= fecha_ref), default=None)
+    if snap_hoy is None:
+        return puerto.sequia_buques_por_zona(pd.DataFrame(), fecha_ref, horizonte_dias)
+    lineup_hoy = _snapshot_lineup(master, snap_hoy)
+    if not lineup_hoy.empty:
+        lineup_hoy = lineup_hoy.copy()
+        lineup_hoy["zona"] = [
+            zona_carga(p, b)
+            for p, b in zip(lineup_hoy["port"], lineup_hoy.get("berth", lineup_hoy["port"]))
+        ]
+    return puerto.sequia_buques_por_zona(lineup_hoy, snap_hoy, horizonte_dias)
 
 
 @st.cache_data(ttl=900, show_spinner="Cargando DJVE...")
@@ -1314,10 +1351,11 @@ def _render_senales_hoy():
     Panel visible con alertas accionables basadas en datos ya cargados.
     No hace queries directas a la DB: usa las funciones cached_* existentes.
 
-    Envuelto en @st.fragment: el calculo de z-scores de shippers de 2 anos
-    se ejecuta en su propio ciclo de render, fuera del camino critico del
-    primer paint del dashboard (y no se re-ejecuta en cada rerun de otros
-    widgets de la pagina).
+    Alertas: datos desactualizados, buques nuevos grandes, congestión zonal
+    extrema (sobrepoblado/vacío) y sequía de buques próximos por zona.
+
+    Envuelto en @st.fragment para que se ejecute en su propio ciclo de render,
+    fuera del camino critico del primer paint del dashboard.
     """
     alertas_info    = []
     alertas_success = []
@@ -1368,6 +1406,46 @@ def _render_senales_hoy():
                     f"{_row.get('cargo','?')} · {_qty_fmt} · "
                     f"Comprador: {_shp} · Puerto: {_row.get('port','?')}"
                 )
+
+    # ---- Alerta: congestión zonal extrema (Q6) ----
+    try:
+        _df_cong_est = cached_congestion_estado(fecha_ref)
+    except Exception:
+        _df_cong_est = pd.DataFrame()
+    if not _df_cong_est.empty:
+        for _, _cr in _df_cong_est.iterrows():
+            _emj = puerto.emoji_estado(_cr["estado"])
+            if _cr["estado"] == "SOBREPOBLADO":
+                alertas_warning.append(
+                    f"{_emj} **Puerto sobrepoblado** · {_cr['zona']} · "
+                    f"{int(_cr['buques_hoy'])} buques en puerto "
+                    f"(p{_cr['percentil']:.0f} de los últimos 90d, "
+                    f"mediana {_cr['mediana_hist']:.0f}) — riesgo de demoras."
+                )
+            elif _cr["estado"] == "VACIO":
+                alertas_info.append(
+                    f"{_emj} **Puerto vacío** · {_cr['zona']} · "
+                    f"{int(_cr['buques_hoy'])} buques "
+                    f"(p{_cr['percentil']:.0f} de los últimos 90d) — actividad floja."
+                )
+
+    # ---- Alerta: sequía de buques próximos (Q5) ----
+    try:
+        _df_sequia = cached_sequia_buques(fecha_ref)
+    except Exception:
+        _df_sequia = pd.DataFrame()
+    if not _df_sequia.empty:
+        _zonas_secas = _df_sequia[_df_sequia["sin_barcos"]]["zona"].tolist()
+        # Solo alertamos por las zonas principales de Up River (las que mueven
+        # el grueso del volumen); que Quequén no tenga buques 7d es habitual.
+        _zonas_secas_relevantes = [
+            z for z in _zonas_secas if z in ("Up River Norte", "Up River Sur")
+        ]
+        for _z in _zonas_secas_relevantes:
+            alertas_info.append(
+                f"🌵 **Sin barcos próximos** · {_z} · "
+                f"ningún buque con ETB en los próximos 7 días — demanda inminente nula."
+            )
 
     # ---- Renderizar ----
     total_alertas = len(alertas_warning) + len(alertas_success) + len(alertas_info)
@@ -3316,12 +3394,92 @@ if _tab_sel == "🌾 PRODUCTOS":
 # PESTANA 4: CONGESTION
 # ==========================================================================
 
+def _render_estado_zonas(fecha_ref: date) -> None:
+    """
+    Estado de cada zona portuaria: congestión hoy vs historia (Q6) y buques
+    que vienen a cargar en los próximos 7 días (Q5). Una tarjeta por zona.
+    """
+    st.subheader("Estado de las zonas portuarias")
+    st.caption(
+        "Congestión = buques operando hoy (etb≤hoy≤ets) vs su percentil de los "
+        "últimos 90 días. Próximos = buques con ETB en los próximos 7 días "
+        "(demanda que viene)."
+    )
+
+    df_cong = cached_congestion_estado(fecha_ref)
+    df_seq = cached_sequia_buques(fecha_ref)
+
+    if df_cong.empty:
+        st.info("Sin datos de congestión disponibles.")
+        return
+
+    seq_idx = df_seq.set_index("zona") if not df_seq.empty else None
+    p = BLOOMBERG_PALETTE
+    _estado_color = {
+        "SOBREPOBLADO": p["negative"],
+        "VACIO": p["text_muted"],
+        "NORMAL": p["positive"],
+        "SIN HISTORIA": p["text_muted"],
+    }
+
+    cols = st.columns(len(df_cong))
+    for col, (_, cr) in zip(cols, df_cong.iterrows()):
+        zona = cr["zona"]
+        estado = cr["estado"]
+        emj = puerto.emoji_estado(estado)
+        color = _estado_color.get(estado, p["text_muted"])
+        pctl_s = f"p{cr['percentil']:.0f}" if cr["percentil"] is not None else "s/hist"
+        med_s = f"{cr['mediana_hist']:.0f}" if pd.notna(cr["mediana_hist"]) else "—"
+
+        if seq_idx is not None and zona in seq_idx.index:
+            sr = seq_idx.loc[zona]
+            n_prox = int(sr["n_buques"])
+            tons_prox = fmt_tons(sr["tons"])
+            prods = [PRODUCTO_DISPLAY.get(c, c) for c in sr["productos"]]
+            prox_txt = (
+                f"{n_prox} buques · {tons_prox}" if n_prox > 0
+                else "🌵 sin barcos próximos"
+            )
+            prod_txt = " · ".join(prods) if prods else "—"
+        else:
+            prox_txt, prod_txt = "—", "—"
+
+        with col:
+            st.markdown(
+                f"<div style='background:{p['bg_card']}; border:1px solid {p['border']}; "
+                f"border-left:3px solid {color}; border-radius:2px; padding:10px 12px; "
+                f"min-height:150px;'>"
+                f"<div style='font-size:11px; letter-spacing:0.08em; "
+                f"color:{p['text_muted']}; text-transform:uppercase; font-weight:700;'>"
+                f"{zona}</div>"
+                f"<div style='font-size:14px; font-weight:700; color:{color}; "
+                f"margin-top:4px;'>{emj} {estado.replace('_',' ')}</div>"
+                f"<div style='font-size:26px; font-weight:700; color:{p['text_primary']}; "
+                f"line-height:1.1;'>{int(cr['buques_hoy'])} <span style='font-size:11px; "
+                f"color:{p['text_muted']};'>buques hoy</span></div>"
+                f"<div style='font-size:10px; color:{p['text_muted']};'>"
+                f"{pctl_s} · mediana {med_s}</div>"
+                f"<div style='border-top:1px solid {p['border']}; margin:8px 0 6px 0;'></div>"
+                f"<div style='font-size:10px; color:{p['text_muted']}; "
+                f"text-transform:uppercase;'>Próximos ≤7d</div>"
+                f"<div style='font-size:12px; font-weight:700; color:{p['text_primary']};'>"
+                f"{prox_txt}</div>"
+                f"<div style='font-size:10px; color:{p['text_muted']};'>{prod_txt}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+    st.divider()
+
+
 @st.fragment
 def _render_congestion_tab(fecha_ref):
     """
     Render de la pestaña Congestión. Como @st.fragment, cambiar cualquier
     filtro solo rerenderiza esta función sin tocar el resto del dashboard.
     """
+    _render_estado_zonas(fecha_ref)
+
     st.subheader(f"Buques en puerto ahora · {fecha_ref}")
 
     df_en_puerto = cached_en_puerto_ahora(fecha_ref)
