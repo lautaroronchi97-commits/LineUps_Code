@@ -2328,7 +2328,8 @@ def _render_panorama_tab(fecha_ref, ventana_dias):
         st.info("Sin data para hoy.")
     else:
         df_hm = df_hoy.copy()
-        df_hm["producto"] = df_hm["cargo"].map(PRODUCTO_DISPLAY).fillna(df_hm["cargo"])
+        _cargo_hm = df_hm["cargo"].astype(str)
+        df_hm["producto"] = _cargo_hm.map(PRODUCTO_DISPLAY).fillna(_cargo_hm)
         pivot = df_hm.pivot_table(
             index="port", columns="producto",
             values="quantity", aggfunc="sum", fill_value=0,
@@ -3374,7 +3375,7 @@ def _render_congestion_tab(fecha_ref):
                 pd.to_datetime(x["etb"]) - pd.to_datetime(x["eta"])
             ).dt.days,
             destino=lambda x: x["dest_orig"].fillna("s/d").str.strip().str.upper(),
-            producto=lambda x: x["cargo"].map(PRODUCTO_DISPLAY).fillna(x["cargo"]),
+            producto=lambda x: x["cargo"].astype(str).map(PRODUCTO_DISPLAY).fillna(x["cargo"].astype(str)),
         )[
             ["zona", "port", "berth", "vessel", "producto", "quantity", "shipper_canon",
              "destino", "eta", "etb", "ets", "dias_en_puerto", "demora_eta", "remarks"]
