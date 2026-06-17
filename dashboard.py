@@ -1369,24 +1369,6 @@ def _render_senales_hoy():
                     f"Comprador: {_shp} · Puerto: {_row.get('port','?')}"
                 )
 
-    # ---- Alerta: z-score de shippers (usando calc ya existente) ----
-    if not _df_pan.empty:
-        _df_zscores = _calcular_zscores_shippers(fecha_ref, ventana_dias)
-        if not _df_zscores.empty:
-            for _, _zrow in _df_zscores.iterrows():
-                _z = float(_zrow.get("Z-score", 0))
-                _shp_n = _zrow["Shipper"]
-                if _z >= 2:
-                    alertas_success.append(
-                        f"🔥 **Surge shipper** · {_shp_n} · "
-                        f"Z-score {_z:+.1f} (muy por encima de su media historica)"
-                    )
-                elif _z <= -2:
-                    alertas_info.append(
-                        f"🔴 **Caida shipper** · {_shp_n} · "
-                        f"Z-score {_z:+.1f} (muy por debajo de su media historica)"
-                    )
-
     # ---- Renderizar ----
     total_alertas = len(alertas_warning) + len(alertas_success) + len(alertas_info)
 
